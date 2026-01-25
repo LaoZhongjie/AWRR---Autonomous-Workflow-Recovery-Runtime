@@ -322,8 +322,10 @@ class BaselineRunner:
             action = diagnosis.action
             if diagnosis.confidence < 0.7:
                 action = b2_action
-            elif b2_action == "escalate" and action in ["retry", "rollback"]:
-                action = b2_action
+            else:
+                # Safety guard: if budget is almost exhausted, prefer escalation over risky retries/rollbacks
+                if step_context.budget_remaining.get("tool_calls", 0) <= 1 and action in ["retry", "rollback"]:
+                    action = "escalate"
 
             if action in ["retry", "rollback"] and current_retries >= 3:
                 action = "escalate"
