@@ -187,7 +187,12 @@ if __name__ == "__main__":
     
     display_df, raw_df = generate_leaderboard(traces_paths)
     
-    if raw_df:
+    if pd is None:
+        has_results = bool(raw_df)
+    else:
+        has_results = not raw_df.empty
+
+    if has_results:
         print("\n")
         if pd is None:
             headers = ["Baseline", "WCR", "RR_task", "RR_event", "MTTR (ms)", "CPS", "CPT", "HIR", "UAR"]
