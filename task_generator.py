@@ -11,6 +11,15 @@ def generate_tasks(n: int = 50, seed: int = SEED) -> list[dict]:
         "Timeout", "HTTP_500", "BadRequest", "AuthDenied",
         "NotFound", "Conflict", "PolicyRejected", "StateCorruption"
     ]
+
+    # Special cases to make B3 meaningfully different from B2:
+    # - "eventual consistency" NotFound that is actually transient (retry helps)
+    # These tasks inject NotFound once; subsequent retry will succeed because fault_id is only injected once.
+    transient_notfound_task_ids = set()
+    # Reserve a small slice of tasks for this scenario (keep it deterministic)
+    for k in range(min(6, max(0, n - 10))):
+        transient_notfound_task_ids.add(k + 8)  # tasks T009.. in 0-based index
+
     
     for i in range(n):
         task_id = f"T{i+1:03d}"
@@ -79,7 +88,17 @@ def generate_tasks(n: int = 50, seed: int = SEED) -> list[dict]:
         # - 最后 10 个任务：无故障（对照组）
         fault_injections = []
         
-        if i < len(fault_types):
+        if i in transient_notfound_task_ids:
+            # Transient NotFound: appears as NotFound but should be handled by retry (B3 can learn this)
+            fault_injections.append({
+                "step_idx": random.choice([0, 3]),
+                "fault_type": "NotFound",
+                "prob": 1.0,
+                "fault_id": f"F{i+1}",
+                "layer_override": "transient",
+                "scenario": "eventual_consistency"
+            })
+        elif i < len(fault_types):
             # 前 8 个任务：覆盖所有故障类型
             fault_type = fault_types[i]
             fault_injections.append({
