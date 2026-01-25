@@ -3,7 +3,7 @@ import random
 from state import WorldState
 
 
-def generate_tasks(n: int = 20, seed: int = 42) -> list[dict]:
+def generate_tasks(n: int = 50, seed: int = 42) -> list[dict]:
     random.seed(seed)
     tasks = []
     
@@ -73,10 +73,14 @@ def generate_tasks(n: int = 20, seed: int = 42) -> list[dict]:
             }
         ]
         
-        # 故障注入 (均匀分布)
+        # 故障注入策略：
+        # - 前 8 个任务：每种故障类型各一个
+        # - 中间 32 个任务：随机故障，概率 0.7-0.9
+        # - 最后 10 个任务：无故障（对照组）
         fault_injections = []
+        
         if i < len(fault_types):
-            # 前8个任务,每个覆盖一种故障类型
+            # 前 8 个任务：覆盖所有故障类型
             fault_type = fault_types[i]
             fault_injections.append({
                 "step_idx": random.randint(0, 4),
@@ -84,16 +88,16 @@ def generate_tasks(n: int = 20, seed: int = 42) -> list[dict]:
                 "prob": 1.0,
                 "fault_id": f"F{i+1}"
             })
-        elif i < 16:
-            # 中间8个任务,随机故障
+        elif i < 40:
+            # 中间 32 个任务：随机故障
             fault_type = random.choice(fault_types)
             fault_injections.append({
                 "step_idx": random.randint(0, 4),
                 "fault_type": fault_type,
-                "prob": 0.8,
+                "prob": random.uniform(0.7, 0.9),
                 "fault_id": f"F{i+1}"
             })
-        # 最后4个任务无故障
+        # 最后 10 个任务无故障
         
         # 成功条件
         success_condition = {
@@ -114,13 +118,22 @@ def generate_tasks(n: int = 20, seed: int = 42) -> list[dict]:
 
 
 if __name__ == "__main__":
-    tasks = generate_tasks(n=20, seed=42)
+    tasks = generate_tasks(n=50, seed=42)
     
     with open("tasks.jsonl", 'w') as f:
         for task in tasks:
             f.write(json.dumps(task) + '\n')
     
     print(f"Generated {len(tasks)} tasks -> tasks.jsonl")
-    print(f"Sample task: {tasks[0]['task_id']}")
-    print(f"  Steps: {len(tasks[0]['steps'])}")
-    print(f"  Faults: {len(tasks[0]['fault_injections'])}")
+    
+    # 统计故障分布
+    fault_dist = {}
+    for task in tasks:
+        for fi in task.get("fault_injections", []):
+            ft = fi["fault_type"]
+            fault_dist[ft] = fault_dist.get(ft, 0) + 1
+    
+    print(f"\nFault distribution:")
+    for ft, count in sorted(fault_dist.items()):
+        print(f"  {ft}: {count}")
+    print(f"  No fault: {sum(1 for t in tasks if not t.get('fault_injections'))}")
