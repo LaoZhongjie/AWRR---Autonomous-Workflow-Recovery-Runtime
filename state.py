@@ -92,6 +92,7 @@ class TraceEvent:
     final_reason: str | None = None
     compensation_action: str | None = None
     saga_stack_depth: int = 0
+    diagnosis: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -120,4 +121,5 @@ class TraceEvent:
             "final_reason": self.final_reason,
             "compensation_action": self.compensation_action,
             "saga_stack_depth": self.saga_stack_depth,
+            "diagnosis": self.diagnosis,
         }

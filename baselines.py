@@ -157,7 +157,8 @@ class BaselineRunner:
                 budget_used_tool_calls=budget_snapshot["used"]["tool_calls"],
                 budget_used_time_s=budget_snapshot["used"]["time"],
                 compensation_action=None,
-                saga_stack_depth=0
+                saga_stack_depth=0,
+                diagnosis=None
             )
             
             # 消耗预算
@@ -171,13 +172,30 @@ class BaselineRunner:
                 step_idx += 1
             else:
                 # 根据 baseline 模式选择恢复策略
+                diagnosis_payload = {
+                    "layer_pred": None,
+                    "action_pred": None,
+                    "confidence": None,
+                    "rationale_short": None
+                }
                 recovery_action = self._get_recovery_action(
                     result, step_idx, retry_counts, world_state, checkpoint,
                     step_context=step_context,
-                    history_events=self.logger.events
+                    history_events=self.logger.events,
+                    diagnosis_payload_ref=lambda payload: payload
                 )
+                if isinstance(recovery_action, tuple):
+                    recovery_action, diagnosis_payload = recovery_action
+                if diagnosis_payload["layer_pred"] is None:
+                    default_layer = "semantic" if result.error_type in ["PolicyRejected", "AuthDenied", "BadRequest"] else "persistent"
+                    diagnosis_payload = {
+                        "layer_pred": default_layer,
+                        "action_pred": recovery_action,
+                        "confidence": 0.5,
+                        "rationale_short": "rule-based fallback"
+                    }
                 event.recovery_action = recovery_action
-                event.event_type = "recovery"
+                event.diagnosis = diagnosis_payload
                 self.logger.append(event)
                 
                 if recovery_action == "fail":
@@ -196,6 +214,13 @@ class BaselineRunner:
                     elif self.mode in ["B2", "B3"]:
                         backoff = 0.1 * (2 ** (retry_counts[step_idx] - 1))
                         time.sleep(min(backoff, 0.4))
+                    continue
+                
+                elif recovery_action == "rollback_then_retry":
+                    world_state.records = checkpoint.records.copy()
+                    world_state.inventory = checkpoint.inventory.copy()
+                    world_state.audit_log = checkpoint.audit_log.copy()
+                    retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
                 
                 elif recovery_action == "rollback":
@@ -242,7 +267,8 @@ class BaselineRunner:
     def _get_recovery_action(self, result, step_idx: int, retry_counts: dict, 
                             world_state: WorldState, checkpoint: WorldState,
                             step_context: StepContext = None,
-                            history_events: list = None) -> str:
+                            history_events: list = None,
+                            diagnosis_payload_ref=None) -> str | tuple[str, dict]:
         """根据 baseline 模式决定恢复动作"""
         error_type = result.error_type
         current_retries = retry_counts.get(step_idx, 0)
@@ -278,18 +304,37 @@ class BaselineRunner:
                 return "escalate"
         
         elif self.mode == "B3":
-            # B3: Diagnosis-driven recovery
-            if step_context is None or history_events is None:
-                # Fallback to B2 if context missing
-                return self._get_recovery_action_b2(result, step_idx, retry_counts)
-            
-            diagnosis = self.diagnosis_agent.diagnose(step_context, result, history_events)
-            
-            # Conservative safety: if confidence < 0.7, escalate
-            if diagnosis.confidence < 0.7:
+            # B3: B2 rules + diagnosis only for ambiguous errors
+            if error_type in ["Timeout", "HTTP_500"]:
+                if current_retries < 3:
+                    return "retry"
                 return "escalate"
-            
-            return diagnosis.action
+            if error_type == "Conflict":
+                if current_retries < 3:
+                    return "rollback_then_retry"
+                return "escalate"
+            if error_type in ["PolicyRejected", "AuthDenied"]:
+                return "escalate"
+            if error_type in ["BadRequest", "NotFound", "StateCorruption"]:
+                return "escalate"
+            if error_type not in ["RuntimeError", "Unknown"]:
+                return "escalate"
+
+            if step_context is None or history_events is None:
+                return self._get_recovery_action_b2(result, step_idx, retry_counts)
+
+            diagnosis = self.diagnosis_agent.diagnose(step_context, result, history_events)
+            payload = {
+                "layer_pred": diagnosis.layer,
+                "action_pred": diagnosis.action,
+                "confidence": diagnosis.confidence,
+                "rationale_short": diagnosis.reasoning[:120]
+            }
+            if diagnosis_payload_ref:
+                payload = diagnosis_payload_ref(payload)
+            if diagnosis.confidence < 0.7:
+                return "escalate", payload
+            return diagnosis.action, payload
         
         return "fail"
     

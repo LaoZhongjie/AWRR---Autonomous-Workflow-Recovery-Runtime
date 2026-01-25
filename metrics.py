@@ -3,8 +3,8 @@ import json
 from collections import defaultdict
 
 FINAL_OUTCOMES = {"success", "escalated", "failed"}
-RECOVERY_ACTIONS = {"retry", "rollback"}
-TOOL_EVENT_TYPES = {"tool_call", "recovery"}
+RECOVERY_ACTIONS = {"retry", "rollback", "rollback_then_retry"}
+TOOL_EVENT_TYPES = {"tool_call"}
 
 
 def _infer_final_outcome(task_events: list[dict], last_step_idx: int) -> str:
@@ -62,16 +62,14 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     recovered_error_events = 0
     mttr_event_times: list[float] = []
 
-    tool_events = [
-        event
-        for event in events
-        if event.get("event_type", "tool_call") in TOOL_EVENT_TYPES
-    ]
-    tool_calls_total = len(tool_events)
+    tool_calls_total = sum(
+        1 for event in events if event.get("event_type", "tool_call") == "tool_call"
+    )
 
     tasks_with_auth_issues = 0
 
     for task_events in tasks.values():
+        task_events = sorted(task_events, key=lambda e: e.get("ts_ms", 0))
         last_step_idx = max(e.get("step_idx", 0) for e in task_events)
         final_event = task_events[-1]
         last_tool_event = next(
@@ -147,7 +145,7 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     mttr_event = sum(mttr_event_times) / len(mttr_event_times) if mttr_event_times else 0.0
 
     baseline_tool_calls = 5 * total_tasks
-    extra_tool_calls = max(tool_calls_total - baseline_tool_calls, 0)
+    extra_tool_calls = tool_calls_total - baseline_tool_calls
     rco = extra_tool_calls / baseline_tool_calls if baseline_tool_calls else 0.0
 
     cpt = tool_calls_total / total_tasks if total_tasks else 0.0

@@ -27,18 +27,6 @@ class DiagnosisAgent:
     Fault diagnosis agent supporting mock and LLM modes
     """
     
-    # Ground truth mapping: error_type -> fault_layer
-    ERROR_TO_LAYER_GT = {
-        "Timeout": "transient",
-        "HTTP_500": "transient",
-        "Conflict": "cascade",
-        "StateCorruption": "cascade",
-        "AuthDenied": "semantic",
-        "PolicyRejected": "semantic",
-        "BadRequest": "semantic",
-        "NotFound": "persistent"
-    }
-    
     def __init__(self, mode: str = "mock"):
         """
         Args:
@@ -83,7 +71,7 @@ class DiagnosisAgent:
         
         修复：调整 confidence 避免过度保守
         """
-        error_type = step_result.error_type
+        error_type = step_result.error_type or "Unknown"
         error_msg = step_result.error_msg or ""
         step_name = step_context.step_name
         
@@ -93,8 +81,18 @@ class DiagnosisAgent:
             if e.step_idx == step_context.step_idx and e.status == "error"
         )
         
-        # Classify layer
-        layer = self.ERROR_TO_LAYER_GT.get(error_type, "persistent")
+        # Heuristic layer classification (no ground-truth helper)
+        message = f"{error_type} {error_msg} {step_name}".lower()
+        if any(token in message for token in ["timeout", "http_500", "temporar", "throttle"]):
+            layer = "transient"
+        elif any(token in message for token in ["conflict", "rollback", "state"]):
+            layer = "cascade"
+        elif any(token in message for token in ["auth", "policy", "badrequest", "validation"]):
+            layer = "semantic"
+        elif any(token in message for token in ["notfound", "missing"]):
+            layer = "persistent"
+        else:
+            layer = "persistent"
         
         # Determine action based on layer and retry count
         if layer == "transient":
@@ -192,13 +190,3 @@ class DiagnosisAgent:
         
         return self._diagnose_mock(step_context, step_result, history_events)
     
-    @staticmethod
-    def get_ground_truth_layer(error_type: str) -> str:
-        """Get ground truth layer for evaluation"""
-        return DiagnosisAgent.ERROR_TO_LAYER_GT.get(error_type, "persistent")
-
-
-# Helper function for external use
-def create_diagnosis_agent(mode: str = "mock") -> DiagnosisAgent:
-    """Factory function to create diagnosis agent"""
-    return DiagnosisAgent(mode=mode)

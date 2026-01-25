@@ -1,6 +1,9 @@
 import json
 import argparse
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover
+    pd = None
 from collections import defaultdict
 from diagnosis import DiagnosisAgent
 from state import StepContext, StepResult, TraceEvent
@@ -47,6 +50,8 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
             if event["status"] != "error" or not event.get("injected_fault"):
                 history_events.append(_event_to_trace_event(event))
                 continue
+            diagnosis = event.get("diagnosis") or {}
+            layer_pred = diagnosis.get("layer_pred")
 
             fault_info = event["injected_fault"]
             layer_gt = fault_info.get("layer_gt")
@@ -81,8 +86,9 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
                 latency_ms=event.get("latency_ms", 0),
                 injected_fault=event.get("injected_fault")
             )
-            diagnosis = diagnosis_agent.diagnose(step_context, step_result, history_events)
-            layer_pred = diagnosis.layer
+            if layer_pred is None:
+                diagnosis = diagnosis_agent.diagnose(step_context, step_result, history_events)
+                layer_pred = diagnosis.layer
             
             diagnosed_errors.append({
                 "task_id": event["task_id"],
@@ -119,7 +125,7 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
             row[gt_layer] = count
         confusion_matrix.append(row)
     
-    confusion_df = pd.DataFrame(confusion_matrix)
+    confusion_df = pd.DataFrame(confusion_matrix) if pd else confusion_matrix
     
     # 统计
     gt_distribution = defaultdict(int)
@@ -199,7 +205,19 @@ def print_rca_results(results: dict):
         print(f"  {layer:12s}: {count:3d}")
     
     print(f"\nConfusion Matrix (rows=predicted, cols=actual):")
-    print(results['confusion_matrix'].to_string(index=False))
+    if pd is None:
+        headers = ["predicted"] + ["transient", "persistent", "semantic", "cascade"]
+        print(" ".join(f"{h:>10s}" for h in headers))
+        for row in results["confusion_matrix"]:
+            print(
+                f"{row['predicted']:>10s}"
+                f"{row['transient']:>10d}"
+                f"{row['persistent']:>10d}"
+                f"{row['semantic']:>10d}"
+                f"{row['cascade']:>10d}"
+            )
+    else:
+        print(results['confusion_matrix'].to_string(index=False))
     
     print(f"\n" + "="*80)
     print(f"SAMPLE DIAGNOSED ERRORS (first {min(10, len(results['sample_errors']))})")
@@ -223,7 +241,7 @@ def print_rca_results(results: dict):
         print(f"  - Only the first error per task is evaluated")
         print(f"  - Total: {results['total']} tasks with errors")
     print(f"  Ground Truth: injected_fault.layer_gt (from fault injection)")
-    print(f"  Prediction: DiagnosisAgent.get_ground_truth_layer(error_type)")
+    print(f"  Prediction: event.diagnosis.layer_pred (fallback: mock DiagnosisAgent)")
     print("="*80 + "\n")
 
 

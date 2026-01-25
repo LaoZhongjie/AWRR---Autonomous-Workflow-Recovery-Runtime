@@ -1,6 +1,10 @@
 import argparse
 from metrics import compute_metrics
-import pandas as pd
+
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover
+    pd = None
 
 
 def generate_leaderboard(traces_paths: dict) -> tuple:
@@ -25,8 +29,11 @@ def generate_leaderboard(traces_paths: dict) -> tuple:
     
     if not results:
         print("No valid results found")
-        return pd.DataFrame(), pd.DataFrame()
+        return [], []
     
+    if pd is None:
+        return results, results
+
     # 转换为 DataFrame
     df_raw = pd.DataFrame(results)
     
@@ -48,16 +55,23 @@ def generate_leaderboard(traces_paths: dict) -> tuple:
     return display_df, df_raw
 
 
-def print_analysis(df_raw: pd.DataFrame):
+def print_analysis(df_raw):
     """打印对比分析 - 重点 B2 vs B3"""
     print("\n" + "="*80)
     print("COMPARATIVE ANALYSIS")
     print("="*80)
     
     # 主分析：B2 vs B3
-    if "B2" in df_raw["baseline"].values and "B3" in df_raw["baseline"].values:
-        b2 = df_raw[df_raw["baseline"] == "B2"].iloc[0]
-        b3 = df_raw[df_raw["baseline"] == "B3"].iloc[0]
+    def _get_row(label):
+        if pd is None:
+            return next(item for item in df_raw if item["baseline"] == label)
+        return df_raw[df_raw["baseline"] == label].iloc[0]
+
+    baselines = [row["baseline"] for row in df_raw] if pd is None else df_raw["baseline"].values
+
+    if "B2" in baselines and "B3" in baselines:
+        b2 = _get_row("B2")
+        b3 = _get_row("B3")
         
         print(f"\n{'='*80}")
         print(f"PRIMARY COMPARISON: B3 (Diagnosis-driven) vs B2 (Rule-based)")
@@ -129,9 +143,9 @@ def print_analysis(df_raw: pd.DataFrame):
         print(f"{'='*80}\n")
     
     # 次要分析：B2 vs B1
-    if "B1" in df_raw["baseline"].values and "B2" in df_raw["baseline"].values:
-        b1 = df_raw[df_raw["baseline"] == "B1"].iloc[0]
-        b2 = df_raw[df_raw["baseline"] == "B2"].iloc[0]
+    if "B1" in baselines and "B2" in baselines:
+        b1 = _get_row("B1")
+        b2 = _get_row("B2")
         
         print(f"\nSECONDARY: B2 vs B1 (Rule-based vs Naive-Retry)")
         print(
@@ -144,8 +158,8 @@ def print_analysis(df_raw: pd.DataFrame):
         )
     
     # B0 基线
-    if "B0" in df_raw["baseline"].values:
-        b0 = df_raw[df_raw["baseline"] == "B0"].iloc[0]
+    if "B0" in baselines:
+        b0 = _get_row("B0")
         print(f"\nB0 (No-Recovery) Baseline:")
         print(f"  WCR: {b0['wcr']:.1%} - lower bound without recovery")
     
@@ -173,15 +187,38 @@ if __name__ == "__main__":
     
     display_df, raw_df = generate_leaderboard(traces_paths)
     
-    if not raw_df.empty:
+    if raw_df:
         print("\n")
-        print(display_df.to_string(index=False))
+        if pd is None:
+            headers = ["Baseline", "WCR", "RR_task", "RR_event", "MTTR (ms)", "CPS", "CPT", "HIR", "UAR"]
+            print(" ".join(f"{h:>10s}" for h in headers))
+            for row in display_df:
+                print(
+                    f"{row['baseline']:>10s}"
+                    f"{row['wcr']:>10.2%}"
+                    f"{row['rr_task']:>10.2%}"
+                    f"{row['rr_event']:>10.2%}"
+                    f"{row['mttr_event']:>10.1f}"
+                    f"{row['cps']:>10.2f}"
+                    f"{row['cpt']:>10.2f}"
+                    f"{row['hir']:>10.2%}"
+                    f"{row['uar']:>10.2%}"
+                )
+        else:
+            print(display_df.to_string(index=False))
         print("\n")
         
         print_analysis(raw_df)
         
         # 保存为 CSV
-        raw_df.to_csv("leaderboard.csv", index=False)
+        if pd is None:
+            import csv
+            with open("leaderboard.csv", "w", newline="") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=raw_df[0].keys())
+                writer.writeheader()
+                writer.writerows(raw_df)
+        else:
+            raw_df.to_csv("leaderboard.csv", index=False)
         print("Detailed results saved to: leaderboard.csv")
     else:
         print("No results to display")

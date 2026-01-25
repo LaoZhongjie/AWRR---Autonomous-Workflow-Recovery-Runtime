@@ -131,7 +131,8 @@ class WorkflowRunner:
                 budget_used_tool_calls=budget_snapshot["used"]["tool_calls"],
                 budget_used_time_s=budget_snapshot["used"]["time"],
                 compensation_action=None,
-                saga_stack_depth=0
+                saga_stack_depth=0,
+                diagnosis=None
             )
             
             # 消耗预算
@@ -150,7 +151,12 @@ class WorkflowRunner:
                     world_state, checkpoint, result, step_idx, failure_history
                 )
                 event.recovery_action = recovery_action
-                event.event_type = "recovery"
+                event.diagnosis = {
+                    "layer_pred": None,
+                    "action_pred": None,
+                    "confidence": None,
+                    "rationale_short": None
+                }
                 self.logger.append(event)
                 
                 if recovery_action == "escalate":
@@ -275,7 +281,8 @@ class WorkflowRunner:
             final_outcome=final_outcome,
             final_reason=reason,
             compensation_action=None,
-            saga_stack_depth=0
+            saga_stack_depth=0,
+            diagnosis=None
         )
         self.logger.append(final_event)
 
