@@ -87,6 +87,8 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     total_error_events = 0
     recovered_error_events = 0
     mttr_event_times: list[float] = []
+    srr_eligible_tasks = 0
+    srr_pass_tasks = 0
 
     tool_calls_total = sum(
         1 for event in events if event.get("event_type", "tool_call") == "tool_call"
@@ -111,6 +113,15 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
 
         if final_outcome == "escalated":
             escalated_tasks += 1
+
+        final_event = next(
+            (e for e in reversed(task_events) if e.get("event_type") == "final"),
+            None
+        )
+        if final_event and final_event.get("srr_eligible") is True:
+            srr_eligible_tasks += 1
+            if final_event.get("srr_pass") is True:
+                srr_pass_tasks += 1
 
         error_events = [
             e
@@ -173,6 +184,7 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
 
     hir = escalated_tasks / total_tasks if total_tasks else 0.0
     uar = tasks_with_auth_issues / total_tasks if total_tasks else 0.0
+    srr = srr_pass_tasks / srr_eligible_tasks if srr_eligible_tasks else 0.0
 
     return {
         "baseline": baseline_name or "unknown",
@@ -186,6 +198,9 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         "cps": cps,
         "rco": rco,
         "uar": uar,
+        "srr": srr,
+        "srr_eligible": srr_eligible_tasks,
+        "srr_pass": srr_pass_tasks,
         "total_tasks": total_tasks,
         "completed": completed_tasks,
         "escalated": escalated_tasks,
@@ -210,6 +225,8 @@ def print_metrics(metrics: dict):
     print(f"CPS (Cost per Success):            {metrics['cps']:8.2f}")
     print(f"CPT (Cost per Task):               {metrics['cpt']:8.2f}")
     print(f"RCO (Recovery Cost Overhead):      {metrics['rco']:6.2%}")
+    if metrics.get("srr_eligible", 0):
+        print(f"SRR (Safe Rollback Rate):          {metrics['srr']:6.2%}")
     print(
         "HIR (Human Intervention Rate):"
         f"    {metrics['hir']:6.2%}  ({metrics['escalated']}/{metrics['total_tasks']})"

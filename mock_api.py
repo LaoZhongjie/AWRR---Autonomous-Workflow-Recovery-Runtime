@@ -239,6 +239,69 @@ def commit(world_state: WorldState, fault_injection: Optional[dict] = None) -> S
     return _execute_tool(world_state, _commit, fault_injection)
 
 
+def lock_inventory(world_state: WorldState, item_id: str, qty: int, fault_injection: Optional[dict] = None) -> StepResult:
+    def _lock(ws: WorldState, item: str, amount: int):
+        available = ws.inventory.get(item, 0)
+        if available < amount:
+            raise ValueError(f"Insufficient inventory for {item}")
+        ws.inventory[item] = available - amount
+        ws.audit_log.append({
+            "action": "lock_inventory",
+            "item_id": item,
+            "qty": amount,
+            "timestamp": int(time.time())
+        })
+        return {"item_id": item, "locked": amount}
+
+    return _execute_tool(world_state, _lock, fault_injection, item_id, qty)
+
+
+def unlock_inventory(world_state: WorldState, item_id: str, qty: int, fault_injection: Optional[dict] = None) -> StepResult:
+    def _unlock(ws: WorldState, item: str, amount: int):
+        ws.inventory[item] = ws.inventory.get(item, 0) + amount
+        ws.audit_log.append({
+            "action": "unlock_inventory",
+            "item_id": item,
+            "qty": amount,
+            "timestamp": int(time.time())
+        })
+        return {"item_id": item, "unlocked": amount}
+
+    return _execute_tool(world_state, _unlock, fault_injection, item_id, qty)
+
+
+def process_payment(world_state: WorldState, order_id: str, amount: int, fault_injection: Optional[dict] = None) -> StepResult:
+    def _process(ws: WorldState, oid: str, amt: int):
+        if oid in ws.records:
+            ws.records[oid]["payment_status"] = "paid"
+            ws.records[oid]["amount"] = amt
+        ws.audit_log.append({
+            "action": "process_payment",
+            "order_id": oid,
+            "amount": amt,
+            "timestamp": int(time.time())
+        })
+        return {"order_id": oid, "paid": True}
+
+    return _execute_tool(world_state, _process, fault_injection, order_id, amount)
+
+
+def refund_payment(world_state: WorldState, order_id: str, amount: int, fault_injection: Optional[dict] = None) -> StepResult:
+    def _refund(ws: WorldState, oid: str, amt: int):
+        if oid in ws.records:
+            ws.records[oid]["payment_status"] = "refunded"
+            ws.records[oid]["refund_amount"] = amt
+        ws.audit_log.append({
+            "action": "refund_payment",
+            "order_id": oid,
+            "amount": amt,
+            "timestamp": int(time.time())
+        })
+        return {"order_id": oid, "refunded": True}
+
+    return _execute_tool(world_state, _refund, fault_injection, order_id, amount)
+
+
 def rollback(world_state: WorldState, checkpoint: WorldState, fault_injection: Optional[dict] = None) -> StepResult:
     def _rollback(ws: WorldState, cp: WorldState):
         # IMPORTANT: deep copy to avoid sharing references with checkpoint

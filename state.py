@@ -93,6 +93,8 @@ class TraceEvent:
     compensation_action: str | None = None
     saga_stack_depth: int = 0
     diagnosis: dict | None = None
+    srr_eligible: bool | None = None
+    srr_pass: bool | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -122,4 +124,6 @@ class TraceEvent:
             "compensation_action": self.compensation_action,
             "saga_stack_depth": self.saga_stack_depth,
             "diagnosis": self.diagnosis,
+            "srr_eligible": self.srr_eligible,
+            "srr_pass": self.srr_pass,
         }

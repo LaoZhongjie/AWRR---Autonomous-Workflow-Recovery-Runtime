@@ -8,17 +8,12 @@ def generate_tasks(n: int = 50, seed: int = SEED) -> list[dict]:
     tasks = []
     
     fault_types = [
-        "Timeout", "HTTP_500", "BadRequest", "AuthDenied",
-        "NotFound", "Conflict", "PolicyRejected", "StateCorruption"
+        "Timeout",
+        "HTTP_500",
+        "Conflict",
+        "PolicyRejected",
+        "StateCorruption"
     ]
-
-    # Special cases to make B3 meaningfully different from B2:
-    # - "eventual consistency" NotFound that is actually transient (retry helps)
-    # These tasks inject NotFound once; subsequent retry will succeed because fault_id is only injected once.
-    transient_notfound_task_ids = set()
-    # Reserve a small slice of tasks for this scenario (keep it deterministic)
-    for k in range(min(6, max(0, n - 10))):
-        transient_notfound_task_ids.add(k + 8)  # tasks T009.. in 0-based index
 
     
     for i in range(n):
@@ -27,19 +22,23 @@ def generate_tasks(n: int = 50, seed: int = SEED) -> list[dict]:
         # 初始状态
         initial_world_state = {
             "records": {
-                f"REC{i+1}": {"status": "pending", "value": random.randint(100, 500)}
+                f"REC{i+1}": {
+                    "status": "pending",
+                    "value": random.randint(100, 500),
+                    "payment_status": "unpaid"
+                }
             },
             "inventory": {
-                "credits": random.randint(500, 1000),
-                "tokens": random.randint(100, 300)
+                "widget": random.randint(8, 20)
             },
             "audit_log": []
         }
         
         record_id = f"REC{i+1}"
-        user_id = f"USER{i+1}"
         
-        # 5 步固定流程
+        # 5 步固定流程 (Saga: lock inventory -> process payment)
+        item_qty = random.randint(1, 3)
+        amount = random.randint(100, 250)
         steps = [
             {
                 "step_idx": 0,
@@ -49,29 +48,23 @@ def generate_tasks(n: int = 50, seed: int = SEED) -> list[dict]:
             },
             {
                 "step_idx": 1,
-                "step_name": "policy_check",
-                "tool_name": "policy_check",
-                "params": {
-                    "action": "approve",
-                    "context": {"required_inventory": {"credits": 50}}
-                }
+                "step_name": "lock_inventory",
+                "tool_name": "lock_inventory",
+                "params": {"item_id": "widget", "qty": item_qty}
             },
             {
                 "step_idx": 2,
+                "step_name": "process_payment",
+                "tool_name": "process_payment",
+                "params": {"order_id": record_id, "amount": amount}
+            },
+            {
+                "step_idx": 3,
                 "step_name": "update_record",
                 "tool_name": "update_record",
                 "params": {
                     "record_id": record_id,
                     "patch": {"status": "approved"}
-                }
-            },
-            {
-                "step_idx": 3,
-                "step_name": "send_message",
-                "tool_name": "send_message",
-                "params": {
-                    "user_id": user_id,
-                    "text": "Your request has been approved"
                 }
             },
             {
@@ -81,42 +74,17 @@ def generate_tasks(n: int = 50, seed: int = SEED) -> list[dict]:
                 "params": {}
             }
         ]
-        
-        # 故障注入策略：
-        # - 前 8 个任务：每种故障类型各一个
-        # - 中间 32 个任务：随机故障，概率 0.7-0.9
-        # - 最后 10 个任务：无故障（对照组）
+
+        # 故障注入策略：至少 50 个任务含库存/支付故障（step 1/2）
         fault_injections = []
-        
-        if i in transient_notfound_task_ids:
-            # Transient NotFound: appears as NotFound but should be handled by retry (B3 can learn this)
-            fault_injections.append({
-                "step_idx": random.choice([0, 3]),
-                "fault_type": "NotFound",
-                "prob": 1.0,
-                "fault_id": f"F{i+1}",
-                "layer_override": "transient",
-                "scenario": "eventual_consistency"
-            })
-        elif i < len(fault_types):
-            # 前 8 个任务：覆盖所有故障类型
-            fault_type = fault_types[i]
-            fault_injections.append({
-                "step_idx": random.randint(0, 4),
-                "fault_type": fault_type,
-                "prob": 1.0,
-                "fault_id": f"F{i+1}"
-            })
-        elif i < 40:
-            # 中间 32 个任务：随机故障
-            fault_type = random.choice(fault_types)
-            fault_injections.append({
-                "step_idx": random.randint(0, 4),
-                "fault_type": fault_type,
-                "prob": random.uniform(0.7, 0.9),
-                "fault_id": f"F{i+1}"
-            })
-        # 最后 10 个任务无故障
+        fault_type = fault_types[i % len(fault_types)]
+        fault_injections.append({
+            "step_idx": random.choice([1, 2]),
+            "fault_type": fault_type,
+            "prob": 0.9,
+            "fault_id": f"F{i+1}",
+            "scenario": "inventory_payment"
+        })
         
         # 成功条件
         success_condition = {

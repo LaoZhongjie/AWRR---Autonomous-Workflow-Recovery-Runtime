@@ -255,7 +255,11 @@ class BaselineRunner:
             "send_message": mock_api.send_message,
             "create_ticket": mock_api.create_ticket,
             "commit": mock_api.commit,
-            "rollback": mock_api.rollback
+            "rollback": mock_api.rollback,
+            "lock_inventory": mock_api.lock_inventory,
+            "unlock_inventory": mock_api.unlock_inventory,
+            "process_payment": mock_api.process_payment,
+            "refund_payment": mock_api.refund_payment,
         }
         
         tool_func = tool_map.get(tool_name)
