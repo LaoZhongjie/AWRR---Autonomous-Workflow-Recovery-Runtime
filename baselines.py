@@ -6,23 +6,34 @@ from state import WorldState, Budget, TraceEvent, StepContext
 from trace_logger import TraceLogger
 from oracle_checker import check_success
 import mock_api
+from constants import SEED
 
 
 class BudgetTracker:
     def __init__(self, budget: Budget):
         self.budget = budget
-        self.budget.start_time = time.time()
+        self.budget.start_time = time.perf_counter()
     
     def estimate_tokens(self, data: dict) -> int:
         return len(json.dumps(data)) // 4
     
     def check_budget(self) -> dict:
-        elapsed = time.time() - self.budget.start_time
+        elapsed = time.perf_counter() - self.budget.start_time
         return {
             "tokens": self.budget.max_tokens - self.budget.used_tokens,
             "tool_calls": self.budget.max_tool_calls - self.budget.used_tool_calls,
             "time": self.budget.max_time_s - elapsed
         }
+
+    def snapshot(self) -> dict:
+        elapsed = time.perf_counter() - self.budget.start_time
+        remaining = self.check_budget()
+        used = {
+            "tokens": self.budget.used_tokens,
+            "tool_calls": self.budget.used_tool_calls,
+            "time": elapsed
+        }
+        return {"remaining": remaining, "used": used}
     
     def is_exhausted(self) -> bool:
         remaining = self.check_budget()
@@ -34,7 +45,7 @@ class BudgetTracker:
 
 
 class BaselineRunner:
-    def __init__(self, mode: str, seed: int = 42, diagnosis_mode: str = "mock"):
+    def __init__(self, mode: str, seed: int = SEED, diagnosis_mode: str = "mock"):
         """
         Args:
             mode: "B0" | "B1" | "B2" | "B3"
@@ -71,7 +82,7 @@ class BaselineRunner:
         # 初始化预算
         budget = Budget(
             max_tokens=10000,
-            max_tool_calls=100,
+            max_tool_calls=50,
             max_time_s=60.0
         )
         tracker = BudgetTracker(budget)
@@ -86,17 +97,21 @@ class BaselineRunner:
         while step_idx < len(steps):
             if tracker.is_exhausted():
                 self._escalate_human(task_id, step_idx, "budget_exhausted", world_state, tracker)
+                self._append_final_event(task_id, step_idx, tracker, "escalated", "budget_exhausted")
                 return {"task_id": task_id, "status": "escalated", "reason": "budget_exhausted"}
             
             step = steps[step_idx]
             tool_name = step["tool_name"]
             params = step["params"]
+            attempt_idx = retry_counts.get(step_idx, 0)
             
             # 查找故障注入
             fault_injection = None
             for fi in fault_injections:
                 if fi["step_idx"] == step_idx:
-                    injected = mock_api.FaultInjector.should_inject(fi, step_idx)
+                    injected = mock_api.FaultInjector.should_inject(
+                        fi, step_idx, task_id, world_state
+                    )
                     if injected:
                         fault_injection = injected
                     break
@@ -106,6 +121,7 @@ class BaselineRunner:
             
             # 记录轨迹
             state_hash = world_state.compute_hash()
+            budget_snapshot = tracker.snapshot()
             
             # 准备 StepContext (for B3)
             step_context = StepContext(
@@ -129,8 +145,20 @@ class BaselineRunner:
                 error_type=result.error_type,
                 injected_fault=result.injected_fault,
                 state_hash=state_hash,
-                budget=tracker.check_budget(),
-                recovery_action=None
+                budget=budget_snapshot["remaining"],
+                recovery_action=None,
+                ts_ms=int(time.time() * 1000),
+                attempt_idx=attempt_idx,
+                event_type="tool_call",
+                budget_remaining_tokens=budget_snapshot["remaining"]["tokens"],
+                budget_remaining_tool_calls=budget_snapshot["remaining"]["tool_calls"],
+                budget_remaining_time_s=budget_snapshot["remaining"]["time"],
+                budget_used_tokens=budget_snapshot["used"]["tokens"],
+                budget_used_tool_calls=budget_snapshot["used"]["tool_calls"],
+                budget_used_time_s=budget_snapshot["used"]["time"],
+                compensation_action=None,
+                saga_stack_depth=0,
+                diagnosis=None
             )
             
             # 消耗预算
@@ -144,19 +172,39 @@ class BaselineRunner:
                 step_idx += 1
             else:
                 # 根据 baseline 模式选择恢复策略
+                diagnosis_payload = {
+                    "layer_pred": None,
+                    "action_pred": None,
+                    "confidence": None,
+                    "rationale_short": None
+                }
                 recovery_action = self._get_recovery_action(
                     result, step_idx, retry_counts, world_state, checkpoint,
                     step_context=step_context,
-                    history_events=self.logger.events
+                    history_events=self.logger.events,
+                    diagnosis_payload_ref=lambda payload: payload
                 )
+                if isinstance(recovery_action, tuple):
+                    recovery_action, diagnosis_payload = recovery_action
+                if diagnosis_payload["layer_pred"] is None:
+                    default_layer = "semantic" if result.error_type in ["PolicyRejected", "AuthDenied", "BadRequest"] else "persistent"
+                    diagnosis_payload = {
+                        "layer_pred": default_layer,
+                        "action_pred": recovery_action,
+                        "confidence": 0.5,
+                        "rationale_short": "rule-based fallback"
+                    }
                 event.recovery_action = recovery_action
+                event.diagnosis = diagnosis_payload
                 self.logger.append(event)
                 
                 if recovery_action == "fail":
+                    self._append_final_event(task_id, step_idx, tracker, "failed", result.error_type)
                     return {"task_id": task_id, "status": "failed", "reason": result.error_type}
                 
                 elif recovery_action == "escalate":
                     self._escalate_human(task_id, step_idx, result.error_type, world_state, tracker)
+                    self._append_final_event(task_id, step_idx, tracker, "escalated", result.error_type)
                     return {"task_id": task_id, "status": "escalated", "reason": result.error_type}
                 
                 elif recovery_action == "retry":
@@ -166,6 +214,13 @@ class BaselineRunner:
                     elif self.mode in ["B2", "B3"]:
                         backoff = 0.1 * (2 ** (retry_counts[step_idx] - 1))
                         time.sleep(min(backoff, 0.4))
+                    continue
+                
+                elif recovery_action == "rollback_then_retry":
+                    world_state.records = checkpoint.records.copy()
+                    world_state.inventory = checkpoint.inventory.copy()
+                    world_state.audit_log = checkpoint.audit_log.copy()
+                    retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
                 
                 elif recovery_action == "rollback":
@@ -178,10 +233,13 @@ class BaselineRunner:
                 elif recovery_action == "compensate":
                     # B3 可能返回 compensate，暂时视为 escalate
                     self._escalate_human(task_id, step_idx, result.error_type, world_state, tracker)
+                    self._append_final_event(task_id, step_idx, tracker, "escalated", "compensate_needed")
                     return {"task_id": task_id, "status": "escalated", "reason": "compensate_needed"}
         
         # 检查成功
         success = check_success(world_state, task)
+        final_outcome = "success" if success else "failed"
+        self._append_final_event(task_id, len(steps) - 1, tracker, final_outcome, None)
         return {
             "task_id": task_id,
             "status": "success" if success else "failed",
@@ -209,7 +267,8 @@ class BaselineRunner:
     def _get_recovery_action(self, result, step_idx: int, retry_counts: dict, 
                             world_state: WorldState, checkpoint: WorldState,
                             step_context: StepContext = None,
-                            history_events: list = None) -> str:
+                            history_events: list = None,
+                            diagnosis_payload_ref=None) -> str | tuple[str, dict]:
         """根据 baseline 模式决定恢复动作"""
         error_type = result.error_type
         current_retries = retry_counts.get(step_idx, 0)
@@ -245,18 +304,37 @@ class BaselineRunner:
                 return "escalate"
         
         elif self.mode == "B3":
-            # B3: Diagnosis-driven recovery
-            if step_context is None or history_events is None:
-                # Fallback to B2 if context missing
-                return self._get_recovery_action_b2(result, step_idx, retry_counts)
-            
-            diagnosis = self.diagnosis_agent.diagnose(step_context, result, history_events)
-            
-            # Conservative safety: if confidence < 0.7, escalate
-            if diagnosis.confidence < 0.7:
+            # B3: B2 rules + diagnosis only for ambiguous errors
+            if error_type in ["Timeout", "HTTP_500"]:
+                if current_retries < 3:
+                    return "retry"
                 return "escalate"
-            
-            return diagnosis.action
+            if error_type == "Conflict":
+                if current_retries < 3:
+                    return "rollback_then_retry"
+                return "escalate"
+            if error_type in ["PolicyRejected", "AuthDenied"]:
+                return "escalate"
+            if error_type in ["BadRequest", "NotFound", "StateCorruption"]:
+                return "escalate"
+            if error_type not in ["RuntimeError", "Unknown"]:
+                return "escalate"
+
+            if step_context is None or history_events is None:
+                return self._get_recovery_action_b2(result, step_idx, retry_counts)
+
+            diagnosis = self.diagnosis_agent.diagnose(step_context, result, history_events)
+            payload = {
+                "layer_pred": diagnosis.layer,
+                "action_pred": diagnosis.action,
+                "confidence": diagnosis.confidence,
+                "rationale_short": diagnosis.reasoning[:120]
+            }
+            if diagnosis_payload_ref:
+                payload = diagnosis_payload_ref(payload)
+            if diagnosis.confidence < 0.7:
+                return "escalate", payload
+            return diagnosis.action, payload
         
         return "fail"
     
@@ -289,8 +367,46 @@ class BaselineRunner:
             severity="critical"
         )
 
+    def _append_final_event(
+        self,
+        task_id: str,
+        step_idx: int,
+        tracker: BudgetTracker,
+        final_outcome: str,
+        reason: str | None
+    ):
+        budget_snapshot = tracker.snapshot()
+        final_event = TraceEvent(
+            task_id=task_id,
+            step_idx=step_idx,
+            step_name="final",
+            tool_name="final",
+            params={},
+            status="final",
+            latency_ms=0,
+            error_type=None,
+            injected_fault=None,
+            state_hash="",
+            budget=budget_snapshot["remaining"],
+            recovery_action=None,
+            ts_ms=int(time.time() * 1000),
+            attempt_idx=0,
+            event_type="final",
+            budget_remaining_tokens=budget_snapshot["remaining"]["tokens"],
+            budget_remaining_tool_calls=budget_snapshot["remaining"]["tool_calls"],
+            budget_remaining_time_s=budget_snapshot["remaining"]["time"],
+            budget_used_tokens=budget_snapshot["used"]["tokens"],
+            budget_used_tool_calls=budget_snapshot["used"]["tool_calls"],
+            budget_used_time_s=budget_snapshot["used"]["time"],
+            final_outcome=final_outcome,
+            final_reason=reason,
+            compensation_action=None,
+            saga_stack_depth=0
+        )
+        self.logger.append(final_event)
 
-def run(tasks_path: str, mode: str, seed: int = 42, diagnosis_mode: str = "mock") -> str:
+
+def run(tasks_path: str, mode: str, seed: int = SEED, diagnosis_mode: str = "mock") -> str:
     """运行 baseline 实验"""
     
     # 加载任务
