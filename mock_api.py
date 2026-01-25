@@ -17,8 +17,22 @@ FAULT_TYPES = [
 ]
 
 
+# 在 mock_api.py 中更新 FaultInjector 类
+
 class FaultInjector:
     """无状态故障注入器"""
+    
+    # Ground truth mapping: fault_type -> layer
+    FAULT_TYPE_TO_LAYER = {
+        "Timeout": "transient",
+        "HTTP_500": "transient",
+        "Conflict": "cascade",
+        "StateCorruption": "cascade",
+        "AuthDenied": "semantic",
+        "PolicyRejected": "semantic",
+        "BadRequest": "semantic",
+        "NotFound": "persistent"
+    }
     
     @staticmethod
     def should_inject(fault_config: Optional[dict], step_idx: int) -> Optional[dict]:
@@ -29,9 +43,11 @@ class FaultInjector:
         if fault_config.get("step_idx") == step_idx:
             prob = fault_config.get("prob", 0.0)
             if random.random() < prob:
+                fault_type = fault_config["fault_type"]
                 return {
-                    "fault_type": fault_config["fault_type"],
-                    "fault_id": fault_config.get("fault_id", "unknown")
+                    "fault_type": fault_type,
+                    "fault_id": fault_config.get("fault_id", "unknown"),
+                    "layer_gt": FaultInjector.FAULT_TYPE_TO_LAYER.get(fault_type, "persistent")
                 }
         return None
 

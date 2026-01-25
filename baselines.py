@@ -2,7 +2,7 @@ import json
 import time
 import argparse
 import random
-from state import WorldState, Budget, TraceEvent
+from state import WorldState, Budget, TraceEvent, StepContext
 from trace_logger import TraceLogger
 from oracle_checker import check_success
 import mock_api
@@ -34,13 +34,30 @@ class BudgetTracker:
 
 
 class BaselineRunner:
-    def __init__(self, mode: str, seed: int = 42):
-        self.mode = mode  # "B0" | "B1" | "B2"
+    def __init__(self, mode: str, seed: int = 42, diagnosis_mode: str = "mock"):
+        """
+        Args:
+            mode: "B0" | "B1" | "B2" | "B3"
+            seed: Random seed for reproducibility
+            diagnosis_mode: "mock" | "llm" (only for B3)
+        """
+        if mode not in ["B0", "B1", "B2", "B3"]:
+            raise ValueError(f"Invalid mode: {mode}")
+        
+        self.mode = mode
         self.logger = TraceLogger()
         self.seed = seed
         random.seed(seed)
+        
+        # B3: Initialize diagnosis agent
+        if mode == "B3":
+            from diagnosis import DiagnosisAgent
+            self.diagnosis_agent = DiagnosisAgent(mode=diagnosis_mode)
+        else:
+            self.diagnosis_agent = None
     
     def run_task(self, task: dict) -> dict:
+        """执行单个任务"""
         task_id = task["task_id"]
         
         # 初始化状态
@@ -63,7 +80,7 @@ class BaselineRunner:
         fault_injections = task.get("fault_injections", [])
         
         checkpoint = world_state.deep_copy()
-        retry_counts = {}  # 每个 step 的重试次数
+        retry_counts = {}
         
         step_idx = 0
         while step_idx < len(steps):
@@ -89,6 +106,18 @@ class BaselineRunner:
             
             # 记录轨迹
             state_hash = world_state.compute_hash()
+            
+            # 准备 StepContext (for B3)
+            step_context = StepContext(
+                task_id=task_id,
+                step_idx=step_idx,
+                step_name=step["step_name"],
+                tool_name=tool_name,
+                params=params,
+                state_hash=state_hash,
+                budget_remaining=tracker.check_budget()
+            )
+            
             event = TraceEvent(
                 task_id=task_id,
                 step_idx=step_idx,
@@ -116,13 +145,14 @@ class BaselineRunner:
             else:
                 # 根据 baseline 模式选择恢复策略
                 recovery_action = self._get_recovery_action(
-                    result, step_idx, retry_counts, world_state, checkpoint
+                    result, step_idx, retry_counts, world_state, checkpoint,
+                    step_context=step_context,
+                    history_events=self.logger.events
                 )
                 event.recovery_action = recovery_action
                 self.logger.append(event)
                 
                 if recovery_action == "fail":
-                    # B0: 直接失败
                     return {"task_id": task_id, "status": "failed", "reason": result.error_type}
                 
                 elif recovery_action == "escalate":
@@ -130,24 +160,25 @@ class BaselineRunner:
                     return {"task_id": task_id, "status": "escalated", "reason": result.error_type}
                 
                 elif recovery_action == "retry":
-                    # 重试同一步骤
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     if self.mode == "B1":
-                        # Naive retry: 简单延迟
                         time.sleep(0.05)
-                    elif self.mode == "B2":
-                        # Rule-based: 指数退避
+                    elif self.mode in ["B2", "B3"]:
                         backoff = 0.1 * (2 ** (retry_counts[step_idx] - 1))
                         time.sleep(min(backoff, 0.4))
                     continue
                 
                 elif recovery_action == "rollback":
-                    # B2: 回滚后重试
                     world_state.records = checkpoint.records.copy()
                     world_state.inventory = checkpoint.inventory.copy()
                     world_state.audit_log = checkpoint.audit_log.copy()
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
+                
+                elif recovery_action == "compensate":
+                    # B3 可能返回 compensate，暂时视为 escalate
+                    self._escalate_human(task_id, step_idx, result.error_type, world_state, tracker)
+                    return {"task_id": task_id, "status": "escalated", "reason": "compensate_needed"}
         
         # 检查成功
         success = check_success(world_state, task)
@@ -158,6 +189,7 @@ class BaselineRunner:
         }
     
     def _execute_step(self, world_state: WorldState, tool_name: str, params: dict, fault_injection):
+        """执行单个步骤"""
         tool_map = {
             "get_record": mock_api.get_record,
             "policy_check": mock_api.policy_check,
@@ -175,7 +207,9 @@ class BaselineRunner:
         return tool_func(world_state, **params, fault_injection=fault_injection)
     
     def _get_recovery_action(self, result, step_idx: int, retry_counts: dict, 
-                            world_state: WorldState, checkpoint: WorldState) -> str:
+                            world_state: WorldState, checkpoint: WorldState,
+                            step_context: StepContext = None,
+                            history_events: list = None) -> str:
         """根据 baseline 模式决定恢复动作"""
         error_type = result.error_type
         current_retries = retry_counts.get(step_idx, 0)
@@ -194,34 +228,61 @@ class BaselineRunner:
         elif self.mode == "B2":
             # B2: Rule-Based Recovery
             if error_type in ["Timeout", "HTTP_500"]:
-                # 可重试错误
                 if current_retries < 3:
                     return "retry"
                 else:
                     return "escalate"
-            
             elif error_type == "Conflict":
-                # 冲突：回滚后重试
                 if current_retries < 3:
                     return "rollback"
                 else:
                     return "escalate"
-            
             elif error_type in ["PolicyRejected", "AuthDenied"]:
-                # 策略/权限问题：立即升级
                 return "escalate"
-            
             elif error_type in ["BadRequest", "NotFound", "StateCorruption"]:
-                # 不可恢复错误
                 return "escalate"
-            
             else:
                 return "escalate"
         
+        elif self.mode == "B3":
+            # B3: Diagnosis-driven recovery
+            if step_context is None or history_events is None:
+                # Fallback to B2 if context missing
+                return self._get_recovery_action_b2(result, step_idx, retry_counts)
+            
+            diagnosis = self.diagnosis_agent.diagnose(step_context, result, history_events)
+            
+            # Conservative safety: if confidence < 0.7, escalate
+            if diagnosis.confidence < 0.7:
+                return "escalate"
+            
+            return diagnosis.action
+        
         return "fail"
+    
+    def _get_recovery_action_b2(self, result, step_idx: int, retry_counts: dict) -> str:
+        """B2 logic for fallback"""
+        error_type = result.error_type
+        current_retries = retry_counts.get(step_idx, 0)
+        
+        if error_type in ["Timeout", "HTTP_500"]:
+            if current_retries < 3:
+                return "retry"
+            else:
+                return "escalate"
+        elif error_type == "Conflict":
+            if current_retries < 3:
+                return "rollback"
+            else:
+                return "escalate"
+        elif error_type in ["PolicyRejected", "AuthDenied"]:
+            return "escalate"
+        else:
+            return "escalate"
     
     def _escalate_human(self, task_id: str, step_idx: int, reason: str, 
                        world_state: WorldState, tracker: BudgetTracker):
+        """升级到人工"""
         mock_api.create_ticket(
             world_state,
             summary=f"[{self.mode}] Task {task_id} escalated at step {step_idx}: {reason}",
@@ -229,7 +290,7 @@ class BaselineRunner:
         )
 
 
-def run(tasks_path: str, mode: str, seed: int = 42) -> str:
+def run(tasks_path: str, mode: str, seed: int = 42, diagnosis_mode: str = "mock") -> str:
     """运行 baseline 实验"""
     
     # 加载任务
@@ -239,7 +300,10 @@ def run(tasks_path: str, mode: str, seed: int = 42) -> str:
             tasks.append(json.loads(line))
     
     print(f"\n{'='*60}")
-    print(f"Running Baseline: {mode}")
+    if mode == "B3":
+        print(f"Running Baseline: {mode} (diagnosis_mode={diagnosis_mode})")
+    else:
+        print(f"Running Baseline: {mode}")
     print(f"Tasks: {len(tasks)}, Seed: {seed}")
     print(f"{'='*60}\n")
     
@@ -247,7 +311,7 @@ def run(tasks_path: str, mode: str, seed: int = 42) -> str:
     random.seed(seed)
     
     # 运行任务
-    runner = BaselineRunner(mode=mode, seed=seed)
+    runner = BaselineRunner(mode=mode, seed=seed, diagnosis_mode=diagnosis_mode)
     results = []
     
     for i, task in enumerate(tasks):
@@ -279,9 +343,10 @@ def run(tasks_path: str, mode: str, seed: int = 42) -> str:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", default="tasks.jsonl")
-    parser.add_argument("--mode", choices=["B0", "B1", "B2"], required=True)
+    parser.add_argument("--mode", choices=["B0", "B1", "B2", "B3"], required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--diagnosis-mode", choices=["mock", "llm"], default="mock")
     args = parser.parse_args()
     
-    traces_path = run(args.tasks, args.mode, args.seed)
+    traces_path = run(args.tasks, args.mode, args.seed, args.diagnosis_mode)
     print(f"Traces saved to: {traces_path}")
