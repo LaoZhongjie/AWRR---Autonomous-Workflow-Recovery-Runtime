@@ -1,12 +1,16 @@
+from __future__ import annotations
+
+import argparse
 import json
 import time
-import argparse
 from dataclasses import dataclass
-from state import WorldState, Budget, StepContext, TraceEvent
-from trace_logger import TraceLogger
-from oracle_checker import check_success, check_consistency
+from typing import Any, Callable, Optional
+
 import mock_api
+from oracle_checker import check_success, check_consistency
 from saga import SagaManager, TransactionStack
+from state import Budget, StepContext, TraceEvent, WorldState
+from trace_logger import TraceLogger
 
 
 class BudgetTracker:
@@ -54,19 +58,10 @@ class WorkflowRunner:
         self.logger = TraceLogger()
         self.use_saga = use_saga
 
-
-@dataclass
-class ToolSpec:
-    name: str
-    do: callable
-    compensate: callable | None
-    irreversible: bool
-    compensate_arg_keys: tuple[str, ...] = ()
-    
     def run_task(self, task: dict) -> dict:
         """执行单个任务"""
         task_id = task["task_id"]
-        
+
         # 初始化状态
         initial_state = task["initial_world_state"]
         world_state = WorldState(
@@ -76,7 +71,22 @@ class ToolSpec:
         )
         saga_manager = SagaManager(self.logger, TransactionStack())
         compensation_needed = False
+        side_effect_started = False  # 只要成功执行过可补偿工具(lock/payment)，就 True
         
+        def _finalize_and_return(outcome: str, reason: str | None):
+            # SRR 只看“最终不是 success 且发生过可补偿副作用”的任务
+            srr_eligible = (side_effect_started and (outcome != "success"))
+            srr_pass = None
+            if srr_eligible:
+                srr_ok, _ = check_consistency(world_state, initial_state)
+                srr_pass = srr_ok
+
+            self._append_final_event(
+                task_id, step_idx, tracker, outcome, reason,
+                srr_eligible=srr_eligible, srr_pass=srr_pass
+            )
+            return {"task_id": task_id, "status": outcome, "reason": reason}
+
         # 初始化预算
         budget = Budget(
             max_tokens=10000,
@@ -84,27 +94,26 @@ class ToolSpec:
             max_time_s=60.0
         )
         tracker = BudgetTracker(budget)
-        
+
         # 执行步骤
         steps = task["steps"]
         fault_injections = task.get("fault_injections", [])
-        
+
         checkpoint = world_state.deep_copy()
         failure_history = []  # 记录失败历史用于死循环检测
         retry_counts = {}
-        
+
         step_idx = 0
         while step_idx < len(steps):
             if tracker.is_exhausted():
                 self._escalate_human(task_id, step_idx, "budget_exhausted", world_state, tracker)
-                self._append_final_event(task_id, step_idx, tracker, "escalated", "budget_exhausted")
-                return {"task_id": task_id, "status": "escalated", "reason": "budget_exhausted"}
-            
+                return _finalize_and_return("escalated", "budget_exhausted")
+
             step = steps[step_idx]
             tool_name = step["tool_name"]
             params = step["params"]
             attempt_idx = retry_counts.get(step_idx, 0)
-            
+
             # 查找故障注入
             fault_injection = None
             for fi in fault_injections:
@@ -115,11 +124,11 @@ class ToolSpec:
                     if injected:
                         fault_injection = injected
                     break
-            
+
             # 执行工具
             tool_spec = self._tool_specs().get(tool_name)
             result = self._execute_step(world_state, tool_name, tool_spec, params, fault_injection)
-            
+
             # 记录轨迹
             state_hash = world_state.compute_hash()
             budget_snapshot = tracker.snapshot()
@@ -149,11 +158,11 @@ class ToolSpec:
                 saga_stack_depth=saga_manager.stack.depth(),
                 diagnosis=None
             )
-            
+
             # 消耗预算
             tokens = tracker.estimate_tokens(params)
             tracker.consume(tokens=tokens, tool_calls=1)
-            
+
             if result.status == "ok":
                 self.logger.append(event)
                 if tool_spec and tool_spec.compensate and not tool_spec.irreversible:
@@ -161,6 +170,7 @@ class ToolSpec:
                         params[key] for key in tool_spec.compensate_arg_keys
                     )
                     saga_manager.stack.push(tool_spec.compensate, compensate_args)
+                    side_effect_started = True
                 checkpoint = world_state.deep_copy()
                 failure_history.clear()
                 retry_counts[step_idx] = 0
@@ -178,11 +188,29 @@ class ToolSpec:
                     "rationale_short": None
                 }
                 self.logger.append(event)
-                
+
                 if recovery_action == "escalate":
+                    # 如果已经产生可逆副作用（saga stack 非空），应尝试补偿（仅 saga 模式）
+                    if saga_manager.stack.depth() > 0 and self.use_saga:
+                        rb = saga_manager.rollback_saga(
+                            world_state=world_state,
+                            task_id=task_id,
+                            step_idx=step_idx,
+                            tracker=tracker,
+                            token_estimator=tracker.estimate_tokens,
+                        )
+                        if rb.status != "ok":
+                            # 补偿失败 -> 转人工（SRR 由 _finalize_and_return 统一计算/写入）
+                            self._escalate_human(
+                                task_id, step_idx,
+                                rb.reason or "compensation_failed",
+                                world_state, tracker
+                            )
+                            return _finalize_and_return("escalated", rb.reason or "compensation_failed")
+
+                    # 正常 escalate 路径（注意：create_ticket 已在 _recover 里做过，这里再做一次也无妨，但不需要）
                     self._escalate_human(task_id, step_idx, result.error_type, world_state, tracker)
-                    self._append_final_event(task_id, step_idx, tracker, "escalated", result.error_type)
-                    return {"task_id": task_id, "status": "escalated", "reason": result.error_type}
+                    return _finalize_and_return("escalated", result.error_type)
                 elif recovery_action == "retry":
                     # 重试同一步骤
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
@@ -235,15 +263,19 @@ class ToolSpec:
                             return {"task_id": task_id, "status": "escalated", "reason": rollback_result.reason}
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
-        
+
         # 检查成功
         success = check_success(world_state, task)
         final_outcome = "success" if success else "failed"
-        srr_eligible = compensation_needed
+
+        # ✅ SRR = Safe Rollback Rate：只评估“最终没有成功且发生过可补偿副作用”的任务
+        srr_eligible = (side_effect_started and (final_outcome != "success"))
+
         srr_pass = None
         if srr_eligible:
             srr_ok, _ = check_consistency(world_state, initial_state)
             srr_pass = srr_ok
+
         self._append_final_event(
             task_id,
             len(steps) - 1,
@@ -253,17 +285,18 @@ class ToolSpec:
             srr_eligible=srr_eligible,
             srr_pass=srr_pass
         )
+
         return {
             "task_id": task_id,
             "status": "success" if success else "failed",
             "steps_executed": len(steps)
         }
-    
+
     def _execute_step(
         self,
         world_state: WorldState,
         tool_name: str,
-        tool_spec: ToolSpec | None,
+        tool_spec: "ToolSpec | None",
         params: dict,
         fault_injection,
     ):
@@ -271,21 +304,21 @@ class ToolSpec:
         if not tool_spec:
             raise ValueError(f"Unknown tool: {tool_name}")
         return tool_spec.do(world_state, **params, fault_injection=fault_injection)
-    
+
     def _recover(self, world_state: WorldState, checkpoint: WorldState, result, step_idx: int, failure_history: list) -> str:
         """恢复策略"""
         error_type = result.error_type
-        
+
         # 死循环检测
         state_hash = world_state.compute_hash()
         failure_history.append((step_idx, state_hash, error_type))
-        
+
         if len(failure_history) >= 3:
             last_three = failure_history[-3:]
             if all(h[1] == last_three[0][1] for h in last_three):
                 # 连续3次失败且状态未变
                 return "escalate"
-        
+
         # 恢复策略
         if error_type in ["Timeout", "HTTP_500"]:
             if len([h for h in failure_history if h[0] == step_idx]) <= 3:
@@ -293,10 +326,10 @@ class ToolSpec:
                 return "retry"
             else:
                 return "escalate"
-        
+
         elif error_type == "Conflict":
             return "rollback"
-        
+
         elif error_type in ["PolicyRejected", "AuthDenied"]:
             mock_api.create_ticket(
                 world_state,
@@ -304,12 +337,12 @@ class ToolSpec:
                 severity="high"
             )
             return "escalate"
-        
+
         elif error_type in ["BadRequest", "NotFound", "StateCorruption"]:
             return "escalate"
-        
+
         return "escalate"
-    
+
     def _escalate_human(self, task_id: str, step_idx: int, reason: str, world_state: WorldState, tracker: BudgetTracker):
         """升级到人工"""
         mock_api.create_ticket(
@@ -384,6 +417,15 @@ class ToolSpec:
             srr_pass=srr_pass
         )
         self.logger.append(final_event)
+
+
+@dataclass
+class ToolSpec:
+    name: str
+    do: Callable[..., Any]
+    compensate: Optional[Callable[..., Any]]
+    irreversible: bool
+    compensate_arg_keys: tuple[str, ...] = ()
 
 
 def main():

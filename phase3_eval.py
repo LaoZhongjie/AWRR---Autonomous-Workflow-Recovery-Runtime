@@ -22,6 +22,10 @@ def main():
     print("| --- | --- | --- | --- | --- |")
     print(_format_row("No Saga", no_saga_metrics))
     print(_format_row("Saga", saga_metrics))
+    print("")
+    print("SRR eligible samples (need compensation):")
+    print(f"  No Saga: {no_saga_metrics.get('srr_eligible', 0)} (pass {no_saga_metrics.get('srr_pass', 0)})")
+    print(f"  Saga   : {saga_metrics.get('srr_eligible', 0)} (pass {saga_metrics.get('srr_pass', 0)})")
 
 
 if __name__ == "__main__":
