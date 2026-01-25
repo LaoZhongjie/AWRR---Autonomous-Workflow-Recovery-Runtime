@@ -1,8 +1,11 @@
 import json
 import argparse
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover
+    pd = None
 from collections import defaultdict
-from diagnosis import DiagnosisAgent
+from state import TraceEvent
 
 
 def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
@@ -15,7 +18,7 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
     
     修复点：
     - 使用 injected_fault.layer_gt 作为真实标签（防泄漏）
-    - 使用 DiagnosisAgent.get_ground_truth_layer(error_type) 作为预测
+    - 使用 event.diagnosis.layer_pred / action_pred 作为预测
     - 明确区分 event-level 和 task-level 评估
     """
     
@@ -29,29 +32,43 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
         print("No events found in traces")
         return {}
     
+    # 按任务分组，保持顺序
+    tasks = defaultdict(list)
+    for event in events:
+        tasks[event["task_id"]].append(event)
+
     # 提取有诊断的错误事件
     diagnosed_errors = []
     seen_tasks = set()  # 用于 task-level 去重
     
-    for event in events:
-        if event["status"] == "error" and event.get("injected_fault"):
+    for task_id, task_events in tasks.items():
+        history_events: list[TraceEvent] = []
+        for event in task_events:
+            if event["status"] != "error" or not event.get("injected_fault"):
+                history_events.append(_event_to_trace_event(event))
+                continue
+            diagnosis = event.get("diagnosis") or {}
+            layer_pred = diagnosis.get("layer_pred") or "unknown"
+            action_pred = diagnosis.get("action_pred") or "unknown"
+
             fault_info = event["injected_fault"]
             layer_gt = fault_info.get("layer_gt")
             error_type = event.get("error_type")
             
             if not layer_gt or not error_type:
+                history_events.append(_event_to_trace_event(event))
                 continue
             
             # Task-level: 只取每个任务的第一个错误
             if evaluation_level == "task":
-                task_id = event["task_id"]
                 if task_id in seen_tasks:
+                    history_events.append(_event_to_trace_event(event))
                     continue
                 seen_tasks.add(task_id)
             
-            # 预测层：使用 mock diagnosis 的映射（模拟真实诊断结果）
-            layer_pred = DiagnosisAgent.get_ground_truth_layer(error_type)
-            
+            action_gt = _get_optimal_action(error_type, layer_gt)
+            action_match = action_pred == action_gt
+
             diagnosed_errors.append({
                 "task_id": event["task_id"],
                 "step_idx": event["step_idx"],
@@ -59,9 +76,13 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
                 "fault_id": fault_info.get("fault_id", "unknown"),
                 "layer_gt": layer_gt,
                 "layer_pred": layer_pred,
+                "action_gt": action_gt,
+                "action_pred": action_pred,
                 "recovery_action": event.get("recovery_action"),
-                "matched": layer_gt == layer_pred
+                "matched": layer_gt == layer_pred,
+                "action_matched": action_match
             })
+            history_events.append(_event_to_trace_event(event))
     
     if not diagnosed_errors:
         print(f"No diagnosed errors found (evaluation_level={evaluation_level})")
@@ -71,12 +92,16 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
     correct = sum(1 for e in diagnosed_errors if e["matched"])
     total = len(diagnosed_errors)
     accuracy = correct / total if total > 0 else 0
+
+    action_correct = sum(1 for e in diagnosed_errors if e["action_matched"])
+    action_accuracy = action_correct / total if total > 0 else 0
     
     # 构建混淆矩阵
     layers = ["transient", "persistent", "semantic", "cascade"]
+    pred_layers = layers + ["unknown"]
     confusion_matrix = []
     
-    for pred_layer in layers:
+    for pred_layer in pred_layers:
         row = {"predicted": pred_layer}
         for gt_layer in layers:
             count = sum(
@@ -86,7 +111,7 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
             row[gt_layer] = count
         confusion_matrix.append(row)
     
-    confusion_df = pd.DataFrame(confusion_matrix)
+    confusion_df = pd.DataFrame(confusion_matrix) if pd else confusion_matrix
     
     # 统计
     gt_distribution = defaultdict(int)
@@ -108,16 +133,46 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
     results = {
         "evaluation_level": evaluation_level,
         "accuracy": accuracy,
+        "action_accuracy": action_accuracy,
+        "action_correct": action_correct,
         "correct": correct,
         "total": total,
         "confusion_matrix": confusion_df,
         "gt_distribution": dict(gt_distribution),
         "pred_distribution": dict(pred_distribution),
         "layer_accuracy": layer_accuracy,
-        "sample_errors": diagnosed_errors[:10]  # 前10个样本
+        "sample_errors": diagnosed_errors[:10],
+        "sample_misclassified": [e for e in diagnosed_errors if not e["matched"]][:10]
     }
     
     return results
+
+
+def _event_to_trace_event(event: dict) -> TraceEvent:
+    return TraceEvent(
+        task_id=event.get("task_id", ""),
+        step_idx=event.get("step_idx", 0),
+        step_name=event.get("step_name", ""),
+        tool_name=event.get("tool_name", ""),
+        params=event.get("params", {}),
+        status=event.get("status", ""),
+        latency_ms=event.get("latency_ms", 0),
+        error_type=event.get("error_type"),
+        injected_fault=event.get("injected_fault"),
+        state_hash=event.get("state_hash", ""),
+        budget=event.get("budget", {}),
+        recovery_action=event.get("recovery_action")
+    )
+
+
+def _get_optimal_action(error_type: str, layer_gt: str) -> str:
+    if error_type == "Conflict":
+        return "rollback"
+    if layer_gt == "transient":
+        return "retry"
+    if layer_gt in ["semantic", "persistent", "cascade"]:
+        return "escalate"
+    return "unknown"
 
 
 def print_rca_results(results: dict):
@@ -132,6 +187,7 @@ def print_rca_results(results: dict):
     print("="*80)
     
     print(f"\nOverall Accuracy: {results['accuracy']:.2%} ({results['correct']}/{results['total']})")
+    print(f"Action Accuracy:  {results['action_accuracy']:.2%} ({results['action_correct']}/{results['total']})")
     
     print(f"\nPer-Layer Accuracy:")
     for layer, acc in sorted(results['layer_accuracy'].items()):
@@ -149,7 +205,19 @@ def print_rca_results(results: dict):
         print(f"  {layer:12s}: {count:3d}")
     
     print(f"\nConfusion Matrix (rows=predicted, cols=actual):")
-    print(results['confusion_matrix'].to_string(index=False))
+    if pd is None:
+        headers = ["predicted"] + ["transient", "persistent", "semantic", "cascade"]
+        print(" ".join(f"{h:>10s}" for h in headers))
+        for row in results["confusion_matrix"]:
+            print(
+                f"{row['predicted']:>10s}"
+                f"{row['transient']:>10d}"
+                f"{row['persistent']:>10d}"
+                f"{row['semantic']:>10d}"
+                f"{row['cascade']:>10d}"
+            )
+    else:
+        print(results['confusion_matrix'].to_string(index=False))
     
     print(f"\n" + "="*80)
     print(f"SAMPLE DIAGNOSED ERRORS (first {min(10, len(results['sample_errors']))})")
@@ -159,7 +227,20 @@ def print_rca_results(results: dict):
         match_symbol = "✓" if error['matched'] else "✗"
         print(f"\n[{i:2d}] {match_symbol} {error['task_id']} step {error['step_idx']} (fault_id: {error['fault_id']})")
         print(f"     Error: {error['error_type']:15s}  GT: {error['layer_gt']:10s}  Pred: {error['layer_pred']:10s}")
-        print(f"     Action: {error['recovery_action'] or 'N/A'}")
+        print(
+            f"     Action: {error['recovery_action'] or 'N/A'}"
+            f"  GT: {error['action_gt']:10s}  Pred: {error['action_pred']:10s}"
+        )
+
+    if results["sample_misclassified"]:
+        print(f"\n" + "="*80)
+        print("SAMPLE MISCLASSIFIED ERRORS")
+        print("="*80)
+        for i, error in enumerate(results["sample_misclassified"], 1):
+            print(
+                f"[{i:2d}] {error['task_id']} step {error['step_idx']}"
+                f"  GT: {error['layer_gt']:10s}  Pred: {error['layer_pred']:10s}"
+            )
     
     print("\n" + "="*80)
     
@@ -173,7 +254,7 @@ def print_rca_results(results: dict):
         print(f"  - Only the first error per task is evaluated")
         print(f"  - Total: {results['total']} tasks with errors")
     print(f"  Ground Truth: injected_fault.layer_gt (from fault injection)")
-    print(f"  Prediction: DiagnosisAgent.get_ground_truth_layer(error_type)")
+    print(f"  Prediction: event.diagnosis.layer_pred (fallback: mock DiagnosisAgent)")
     print("="*80 + "\n")
 
 
