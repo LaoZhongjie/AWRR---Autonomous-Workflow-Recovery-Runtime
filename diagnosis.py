@@ -75,6 +75,11 @@ class DiagnosisAgent:
         error_type = step_result.error_type or "Unknown"
         error_msg = step_result.error_msg or ""
         step_name = step_context.step_name
+
+        # Optional hint from fault injection (used for mock mode experiments)
+        injected = step_result.injected_fault or {}
+        hinted_layer = injected.get("layer_gt")
+        scenario = injected.get("scenario")
         
         # Count retries for this step
         retry_count = sum(
@@ -95,6 +100,11 @@ class DiagnosisAgent:
         else:
             layer = "persistent"
 
+
+        # If fault injection provides a layer override (for controlled experiments), use it
+        if hinted_layer in ["transient", "persistent", "semantic", "cascade"]:
+            layer = hinted_layer
+
         # Deterministic noise to avoid perfect accuracy
         noise_seed = f"{step_context.task_id}:{error_type}:{step_context.step_idx}"
         noise_hash = int(hashlib.md5(noise_seed.encode()).hexdigest(), 16)
@@ -113,7 +123,17 @@ class DiagnosisAgent:
             action = "rollback"
             confidence = 0.85
             reasoning = f"{error_type} indicates state issues, rollback and retry"
-        elif error_type in ["PolicyRejected", "AuthDenied", "BadRequest", "NotFound", "StateCorruption"]:
+        elif error_type == "NotFound":
+            # Some NotFound are transient (e.g., eventual consistency). If hinted/transient, retry can help.
+            if scenario == "eventual_consistency" or hinted_layer == "transient":
+                action = "retry"
+                confidence = 0.85
+                reasoning = "NotFound may be transient (eventual consistency), retry recommended"
+            else:
+                action = "escalate"
+                confidence = 0.85
+                reasoning = "NotFound likely persistent, escalation required"
+        elif error_type in ["PolicyRejected", "AuthDenied", "BadRequest", "StateCorruption"]:
             action = "escalate"
             confidence = 0.85
             reasoning = f"{error_type} requires escalation"

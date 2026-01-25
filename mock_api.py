@@ -1,4 +1,5 @@
 import hashlib
+import json
 import random
 import time
 from state import WorldState, StepResult
@@ -30,7 +31,7 @@ class FaultInjector:
         "HTTP_500": "transient",
         "Conflict": "cascade",
         "StateCorruption": "cascade",
-        "AuthDenied": "semantic",
+        "AuthDenied": "persistent",
         "PolicyRejected": "semantic",
         "BadRequest": "semantic",
         "NotFound": "persistent"
@@ -65,8 +66,9 @@ class FaultInjector:
             return {
                 "fault_type": fault_type,
                 "fault_id": fault_id,
-                "layer_gt": FaultInjector.FAULT_TYPE_TO_LAYER.get(fault_type, "persistent"),
-                "task_id": task_id
+                "layer_gt": fault_config.get("layer_override") or FaultInjector.FAULT_TYPE_TO_LAYER.get(fault_type, "persistent"),
+                "task_id": task_id,
+                "scenario": fault_config.get("scenario")
             }
         return None
 
@@ -239,9 +241,10 @@ def commit(world_state: WorldState, fault_injection: Optional[dict] = None) -> S
 
 def rollback(world_state: WorldState, checkpoint: WorldState, fault_injection: Optional[dict] = None) -> StepResult:
     def _rollback(ws: WorldState, cp: WorldState):
-        ws.records = cp.records
-        ws.inventory = cp.inventory
-        ws.audit_log = cp.audit_log + [{
+        # IMPORTANT: deep copy to avoid sharing references with checkpoint
+        ws.records = json.loads(json.dumps(cp.records))
+        ws.inventory = json.loads(json.dumps(cp.inventory))
+        ws.audit_log = json.loads(json.dumps(cp.audit_log)) + [{
             "action": "rollback",
             "timestamp": int(time.time())
         }]
