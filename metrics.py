@@ -1,6 +1,7 @@
 import argparse
 import json
 from collections import defaultdict
+from typing import Tuple
 
 FINAL_OUTCOMES = {"success", "escalated", "failed"}
 RECOVERY_ACTIONS = {"retry", "rollback", "rollback_then_retry"}
@@ -23,6 +24,31 @@ def _infer_final_outcome(task_events: list[dict], last_step_idx: int) -> str:
         return "success"
     return "failed"
 
+def _task_call_counts(task_events) -> Tuple[int, int]:
+    actual_calls = 0
+    seen_steps = set()
+    base_calls = 0
+    for e in task_events:
+        if e.get("event_type", "tool_call") != "tool_call":
+            continue
+        actual_calls += 1
+        step_idx = e.get("step_idx", 0)
+        if step_idx not in seen_steps:
+            seen_steps.add(step_idx)
+            base_calls += 1
+    return base_calls, actual_calls
+
+
+def _mttr_delta_ms(task_events, err_i: int, ok_i: int) -> float:
+    err_ts = task_events[err_i].get("ts_ms")
+    ok_ts = task_events[ok_i].get("ts_ms")
+    if err_ts is not None and ok_ts is not None and ok_ts >= err_ts:
+        return float(ok_ts - err_ts)
+
+    total = 0.0
+    for e in task_events[err_i: ok_i + 1]:
+        total += float(e.get("latency_ms", 0) or 0)
+    return total
 
 def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     """
@@ -66,12 +92,19 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         1 for event in events if event.get("event_type", "tool_call") == "tool_call"
     )
 
+    rco_base_calls_total = 0
+    rco_overhead_calls_total = 0
+
     tasks_with_auth_issues = 0
 
     for task_events in tasks.values():
         task_events = sorted(task_events, key=lambda e: e.get("ts_ms", 0))
         last_step_idx = max(e.get("step_idx", 0) for e in task_events)
         final_outcome = _infer_final_outcome(task_events, last_step_idx)
+
+        base_calls_task, actual_calls_task = _task_call_counts(task_events)
+        rco_base_calls_total += base_calls_task
+        rco_overhead_calls_total += max(actual_calls_task - base_calls_task, 0)
 
         if final_outcome == "success":
             completed_tasks += 1
@@ -114,7 +147,9 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
             if recovered_event:
                 recovered_error_events += 1
                 if error_ts is not None and recovered_event.get("ts_ms") is not None:
-                    mttr_event_times.append(recovered_event["ts_ms"] - error_ts)
+                    ok_i = task_events.index(recovered_event)
+                    mttr_event_times.append(_mttr_delta_ms(task_events, idx, ok_i))
+
 
         auth_errors = [
             e
@@ -131,9 +166,7 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     )
     mttr_event = sum(mttr_event_times) / len(mttr_event_times) if mttr_event_times else 0.0
 
-    baseline_tool_calls = 5 * total_tasks
-    extra_tool_calls = tool_calls_total - baseline_tool_calls
-    rco = extra_tool_calls / baseline_tool_calls if baseline_tool_calls else 0.0
+    rco = (rco_overhead_calls_total / rco_base_calls_total) if rco_base_calls_total else 0.0
 
     cpt = tool_calls_total / total_tasks if total_tasks else 0.0
     cps = tool_calls_total / max(completed_tasks, 1)
@@ -157,7 +190,7 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         "completed": completed_tasks,
         "escalated": escalated_tasks,
         "tool_calls_total": tool_calls_total,
-        "baseline_calls": baseline_tool_calls,
+        "baseline_calls": rco_base_calls_total,
         "actual_calls": tool_calls_total,
     }
 
