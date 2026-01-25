@@ -31,15 +31,19 @@ def generate_leaderboard(traces_paths: dict) -> tuple:
     df_raw = pd.DataFrame(results)
     
     # 选择展示列并格式化
-    display_df = pd.DataFrame({
-        "Baseline": df_raw["baseline"],
-        "WCR": df_raw["wcr"].apply(lambda x: f"{x:.2%}"),
-        "RR": df_raw["rr"].apply(lambda x: f"{x:.2%}"),
-        "MTTR (ms)": df_raw["mttr"].apply(lambda x: f"{x:.1f}"),
-        "RCO": df_raw["rco"].apply(lambda x: f"{x:.2%}"),
-        "HIR": df_raw["hir"].apply(lambda x: f"{x:.2%}"),
-        "UAR": df_raw["uar"].apply(lambda x: f"{x:.2%}")
-    })
+    display_df = pd.DataFrame(
+        {
+            "Baseline": df_raw["baseline"],
+            "WCR": df_raw["wcr"].apply(lambda x: f"{x:.2%}"),
+            "RR_task": df_raw["rr_task"].apply(lambda x: f"{x:.2%}"),
+            "RR_event": df_raw["rr_event"].apply(lambda x: f"{x:.2%}"),
+            "MTTR (ms)": df_raw["mttr_event"].apply(lambda x: f"{x:.1f}"),
+            "CPS": df_raw["cps"].apply(lambda x: f"{x:.2f}"),
+            "CPT": df_raw["cpt"].apply(lambda x: f"{x:.2f}"),
+            "HIR": df_raw["hir"].apply(lambda x: f"{x:.2%}"),
+            "UAR": df_raw["uar"].apply(lambda x: f"{x:.2%}"),
+        }
+    )
     
     return display_df, df_raw
 
@@ -60,8 +64,9 @@ def print_analysis(df_raw: pd.DataFrame):
         print(f"{'='*80}")
         
         wcr_delta = (b3["wcr"] - b2["wcr"]) * 100
-        rr_delta = (b3["rr"] - b2["rr"]) * 100
-        mttr_delta = ((b3["mttr"] - b2["mttr"]) / b2["mttr"] * 100) if b2["mttr"] > 0 else 0
+        rr_task_delta = (b3["rr_task"] - b2["rr_task"]) * 100
+        rr_event_delta = (b3["rr_event"] - b2["rr_event"]) * 100
+        mttr_delta = ((b3["mttr_event"] - b2["mttr_event"]) / b2["mttr_event"] * 100) if b2["mttr_event"] > 0 else 0
         rco_delta = (b3["rco"] - b2["rco"]) * 100
         hir_delta = (b3["hir"] - b2["hir"]) * 100
         
@@ -70,15 +75,26 @@ def print_analysis(df_raw: pd.DataFrame):
         print(f"  B3: {b3['wcr']:.1%}  ({b3['completed']}/{b3['total_tasks']})")
         print(f"  Δ:  {wcr_delta:+.1f} pp {'✓ BETTER' if wcr_delta > 0 else '✗ WORSE' if wcr_delta < 0 else '= SAME'}")
         
-        print(f"\nRecovery Rate (RR):")
-        print(f"  B2: {b2['rr']:.1%}  ({b2['recovered']}/{b2['total_errors']})")
-        print(f"  B3: {b3['rr']:.1%}  ({b3['recovered']}/{b3['total_errors']})")
-        print(f"  Δ:  {rr_delta:+.1f} pp {'✓ BETTER' if rr_delta > 0 else '✗ WORSE' if rr_delta < 0 else '= SAME'}")
+        print(f"\nRecovery Rate (RR_task):")
+        print(f"  B2: {b2['rr_task']:.1%}")
+        print(f"  B3: {b3['rr_task']:.1%}")
+        print(
+            f"  Δ:  {rr_task_delta:+.1f} pp "
+            f"{'✓ BETTER' if rr_task_delta > 0 else '✗ WORSE' if rr_task_delta < 0 else '= SAME'}"
+        )
+
+        print(f"\nRecovery Rate (RR_event):")
+        print(f"  B2: {b2['rr_event']:.1%}")
+        print(f"  B3: {b3['rr_event']:.1%}")
+        print(
+            f"  Δ:  {rr_event_delta:+.1f} pp "
+            f"{'✓ BETTER' if rr_event_delta > 0 else '✗ WORSE' if rr_event_delta < 0 else '= SAME'}"
+        )
         
         print(f"\nMean Time To Recovery (MTTR):")
-        print(f"  B2: {b2['mttr']:.1f} ms")
-        print(f"  B3: {b3['mttr']:.1f} ms")
-        if b2["mttr"] > 0:
+        print(f"  B2: {b2['mttr_event']:.1f} ms")
+        print(f"  B3: {b3['mttr_event']:.1f} ms")
+        if b2["mttr_event"] > 0:
             print(f"  Δ:  {mttr_delta:+.1f}% {'✓ FASTER' if mttr_delta < 0 else '✗ SLOWER' if mttr_delta > 0 else '= SAME'}")
         
         print(f"\nRecovery Cost Overhead (RCO):")
@@ -118,8 +134,14 @@ def print_analysis(df_raw: pd.DataFrame):
         b2 = df_raw[df_raw["baseline"] == "B2"].iloc[0]
         
         print(f"\nSECONDARY: B2 vs B1 (Rule-based vs Naive-Retry)")
-        print(f"  WCR: {b2['wcr']:.1%} vs {b1['wcr']:.1%}  (Δ {(b2['wcr']-b1['wcr'])*100:+.1f} pp)")
-        print(f"  RCO: {b2['rco']:.1%} vs {b1['rco']:.1%}  (Δ {(b2['rco']-b1['rco'])*100:+.1f} pp)")
+        print(
+            f"  WCR: {b2['wcr']:.1%} vs {b1['wcr']:.1%}"
+            f"  (Δ {(b2['wcr']-b1['wcr'])*100:+.1f} pp)"
+        )
+        print(
+            f"  RCO: {b2['rco']:.1%} vs {b1['rco']:.1%}"
+            f"  (Δ {(b2['rco']-b1['rco'])*100:+.1f} pp)"
+        )
     
     # B0 基线
     if "B0" in df_raw["baseline"].values:

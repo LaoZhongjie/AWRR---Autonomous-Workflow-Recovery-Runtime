@@ -9,6 +9,8 @@ class WorldState:
     records: dict
     inventory: dict
     audit_log: list
+    fault_log: set[str] = field(default_factory=set)
+    fault_plan: dict[str, bool] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -25,7 +27,9 @@ class WorldState:
         return WorldState(
             records=json.loads(json.dumps(self.records)),
             inventory=json.loads(json.dumps(self.inventory)),
-            audit_log=json.loads(json.dumps(self.audit_log))
+            audit_log=json.loads(json.dumps(self.audit_log)),
+            fault_log=set(self.fault_log),
+            fault_plan=dict(self.fault_plan)
         )
 
 
@@ -75,6 +79,19 @@ class TraceEvent:
     state_hash: str
     budget: dict
     recovery_action: str | None
+    ts_ms: int | None = None
+    attempt_idx: int = 0
+    event_type: str = "tool_call"
+    budget_remaining_tokens: int | None = None
+    budget_remaining_tool_calls: int | None = None
+    budget_remaining_time_s: float | None = None
+    budget_used_tokens: int | None = None
+    budget_used_tool_calls: int | None = None
+    budget_used_time_s: float | None = None
+    final_outcome: str | None = None
+    final_reason: str | None = None
+    compensation_action: str | None = None
+    saga_stack_depth: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -89,5 +106,18 @@ class TraceEvent:
             "injected_fault": self.injected_fault,
             "state_hash": self.state_hash,
             "budget": self.budget,
-            "recovery_action": self.recovery_action
+            "recovery_action": self.recovery_action,
+            "ts_ms": self.ts_ms,
+            "attempt_idx": self.attempt_idx,
+            "event_type": self.event_type,
+            "budget_remaining_tokens": self.budget_remaining_tokens,
+            "budget_remaining_tool_calls": self.budget_remaining_tool_calls,
+            "budget_remaining_time_s": self.budget_remaining_time_s,
+            "budget_used_tokens": self.budget_used_tokens,
+            "budget_used_tool_calls": self.budget_used_tool_calls,
+            "budget_used_time_s": self.budget_used_time_s,
+            "final_outcome": self.final_outcome,
+            "final_reason": self.final_reason,
+            "compensation_action": self.compensation_action,
+            "saga_stack_depth": self.saga_stack_depth,
         }

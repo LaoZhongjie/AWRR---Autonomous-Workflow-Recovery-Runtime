@@ -1,7 +1,9 @@
+import hashlib
 import random
 import time
 from state import WorldState, StepResult
 from typing import Optional
+from constants import SEED
 
 
 # 故障类型常量
@@ -35,31 +37,80 @@ class FaultInjector:
     }
     
     @staticmethod
-    def should_inject(fault_config: Optional[dict], step_idx: int) -> Optional[dict]:
+    def should_inject(
+        fault_config: Optional[dict],
+        step_idx: int,
+        task_id: str,
+        world_state: WorldState
+    ) -> Optional[dict]:
         """检查是否应该注入故障"""
         if not fault_config:
             return None
-        
-        if fault_config.get("step_idx") == step_idx:
+
+        if fault_config.get("step_idx") != step_idx:
+            return None
+
+        fault_id = fault_config.get("fault_id", "unknown")
+        if fault_id in world_state.fault_log:
+            return None
+
+        if fault_id not in world_state.fault_plan:
             prob = fault_config.get("prob", 0.0)
-            if random.random() < prob:
-                fault_type = fault_config["fault_type"]
-                return {
-                    "fault_type": fault_type,
-                    "fault_id": fault_config.get("fault_id", "unknown"),
-                    "layer_gt": FaultInjector.FAULT_TYPE_TO_LAYER.get(fault_type, "persistent")
-                }
+            rng = _seeded_random(SEED, task_id, fault_id, step_idx)
+            world_state.fault_plan[fault_id] = rng.random() < prob
+
+        if world_state.fault_plan.get(fault_id, False):
+            fault_type = fault_config["fault_type"]
+            world_state.fault_log.add(fault_id)
+            return {
+                "fault_type": fault_type,
+                "fault_id": fault_id,
+                "layer_gt": FaultInjector.FAULT_TYPE_TO_LAYER.get(fault_type, "persistent"),
+                "task_id": task_id
+            }
         return None
 
 
-def _execute_tool(world_state: WorldState, tool_func, fault_injection: Optional[dict], *args, **kwargs) -> StepResult:
+def _seeded_random(*parts) -> random.Random:
+    seed_payload = ":".join(str(p) for p in parts)
+    seed_hash = hashlib.md5(seed_payload.encode()).hexdigest()
+    seed_int = int(seed_hash, 16) % (2**32)
+    return random.Random(seed_int)
+
+
+def _fault_latency_ms(fault_type: str, fault_seed: str) -> int:
+    latency_ranges = {
+        "Timeout": (50, 150),
+        "HTTP_500": (30, 80),
+        "BadRequest": (10, 40),
+        "AuthDenied": (10, 40),
+        "NotFound": (10, 40),
+        "Conflict": (20, 60),
+        "PolicyRejected": (10, 40),
+        "StateCorruption": (20, 60)
+    }
+    low, high = latency_ranges.get(fault_type, (10, 40))
+    rng = _seeded_random(SEED, fault_seed, fault_type)
+    return rng.randint(low, high)
+
+
+def _execute_tool(
+    world_state: WorldState,
+    tool_func,
+    fault_injection: Optional[dict],
+    *args,
+    **kwargs
+) -> StepResult:
     """通用工具执行包装器"""
-    start_ms = int(time.time() * 1000)
+    start_ns = time.perf_counter_ns()
     
     # 注入故障
     if fault_injection:
         fault_type = fault_injection["fault_type"]
-        latency_ms = int(time.time() * 1000) - start_ms
+        fault_seed = f"{fault_injection.get('task_id', 'unknown')}:{fault_injection.get('fault_id', 'unknown')}"
+        simulated_latency_ms = _fault_latency_ms(fault_type, fault_seed)
+        time.sleep(simulated_latency_ms / 1000.0)
+        latency_ms = int((time.perf_counter_ns() - start_ns) / 1_000_000)
         
         error_messages = {
             "Timeout": "Request timeout after 30s",
@@ -85,7 +136,7 @@ def _execute_tool(world_state: WorldState, tool_func, fault_injection: Optional[
     # 正常执行
     try:
         result = tool_func(world_state, *args, **kwargs)
-        latency_ms = int(time.time() * 1000) - start_ms
+        latency_ms = int((time.perf_counter_ns() - start_ns) / 1_000_000)
         return StepResult(
             status="ok",
             output=result,
@@ -96,7 +147,7 @@ def _execute_tool(world_state: WorldState, tool_func, fault_injection: Optional[
             injected_fault=None
         )
     except Exception as e:
-        latency_ms = int(time.time() * 1000) - start_ms
+        latency_ms = int((time.perf_counter_ns() - start_ns) / 1_000_000)
         return StepResult(
             status="error",
             output=None,

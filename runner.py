@@ -10,7 +10,7 @@ import mock_api
 class BudgetTracker:
     def __init__(self, budget: Budget):
         self.budget = budget
-        self.budget.start_time = time.time()
+        self.budget.start_time = time.perf_counter()
     
     def estimate_tokens(self, data: dict) -> int:
         """估算 token 使用"""
@@ -18,12 +18,23 @@ class BudgetTracker:
     
     def check_budget(self) -> dict:
         """检查预算剩余"""
-        elapsed = time.time() - self.budget.start_time
+        elapsed = time.perf_counter() - self.budget.start_time
         return {
             "tokens": self.budget.max_tokens - self.budget.used_tokens,
             "tool_calls": self.budget.max_tool_calls - self.budget.used_tool_calls,
             "time": self.budget.max_time_s - elapsed
         }
+
+    def snapshot(self) -> dict:
+        """返回预算剩余和已用"""
+        elapsed = time.perf_counter() - self.budget.start_time
+        remaining = self.check_budget()
+        used = {
+            "tokens": self.budget.used_tokens,
+            "tool_calls": self.budget.used_tool_calls,
+            "time": elapsed
+        }
+        return {"remaining": remaining, "used": used}
     
     def is_exhausted(self) -> bool:
         """检查预算是否耗尽"""
@@ -66,22 +77,27 @@ class WorkflowRunner:
         
         checkpoint = world_state.deep_copy()
         failure_history = []  # 记录失败历史用于死循环检测
+        retry_counts = {}
         
         step_idx = 0
         while step_idx < len(steps):
             if tracker.is_exhausted():
                 self._escalate_human(task_id, step_idx, "budget_exhausted", world_state, tracker)
+                self._append_final_event(task_id, step_idx, tracker, "escalated", "budget_exhausted")
                 return {"task_id": task_id, "status": "escalated", "reason": "budget_exhausted"}
             
             step = steps[step_idx]
             tool_name = step["tool_name"]
             params = step["params"]
+            attempt_idx = retry_counts.get(step_idx, 0)
             
             # 查找故障注入
             fault_injection = None
             for fi in fault_injections:
                 if fi["step_idx"] == step_idx:
-                    injected = mock_api.FaultInjector.should_inject(fi, step_idx)
+                    injected = mock_api.FaultInjector.should_inject(
+                        fi, step_idx, task_id, world_state
+                    )
                     if injected:
                         fault_injection = injected
                     break
@@ -91,6 +107,7 @@ class WorkflowRunner:
             
             # 记录轨迹
             state_hash = world_state.compute_hash()
+            budget_snapshot = tracker.snapshot()
             event = TraceEvent(
                 task_id=task_id,
                 step_idx=step_idx,
@@ -102,8 +119,19 @@ class WorkflowRunner:
                 error_type=result.error_type,
                 injected_fault=result.injected_fault,
                 state_hash=state_hash,
-                budget=tracker.check_budget(),
-                recovery_action=None
+                budget=budget_snapshot["remaining"],
+                recovery_action=None,
+                ts_ms=int(time.time() * 1000),
+                attempt_idx=attempt_idx,
+                event_type="tool_call",
+                budget_remaining_tokens=budget_snapshot["remaining"]["tokens"],
+                budget_remaining_tool_calls=budget_snapshot["remaining"]["tool_calls"],
+                budget_remaining_time_s=budget_snapshot["remaining"]["time"],
+                budget_used_tokens=budget_snapshot["used"]["tokens"],
+                budget_used_tool_calls=budget_snapshot["used"]["tool_calls"],
+                budget_used_time_s=budget_snapshot["used"]["time"],
+                compensation_action=None,
+                saga_stack_depth=0
             )
             
             # 消耗预算
@@ -114,6 +142,7 @@ class WorkflowRunner:
                 self.logger.append(event)
                 checkpoint = world_state.deep_copy()
                 failure_history.clear()
+                retry_counts[step_idx] = 0
                 step_idx += 1
             else:
                 # 恢复策略
@@ -121,20 +150,26 @@ class WorkflowRunner:
                     world_state, checkpoint, result, step_idx, failure_history
                 )
                 event.recovery_action = recovery_action
+                event.event_type = "recovery"
                 self.logger.append(event)
                 
                 if recovery_action == "escalate":
                     self._escalate_human(task_id, step_idx, result.error_type, world_state, tracker)
+                    self._append_final_event(task_id, step_idx, tracker, "escalated", result.error_type)
                     return {"task_id": task_id, "status": "escalated", "reason": result.error_type}
                 elif recovery_action == "retry":
                     # 重试同一步骤
+                    retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
                 elif recovery_action == "rollback":
                     # 回滚后重试
+                    retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
         
         # 检查成功
         success = check_success(world_state, task)
+        final_outcome = "success" if success else "failed"
+        self._append_final_event(task_id, len(steps) - 1, tracker, final_outcome, None)
         return {
             "task_id": task_id,
             "status": "success" if success else "failed",
@@ -205,6 +240,44 @@ class WorkflowRunner:
             summary=f"Task {task_id} escalated at step {step_idx}: {reason}",
             severity="critical"
         )
+
+    def _append_final_event(
+        self,
+        task_id: str,
+        step_idx: int,
+        tracker: BudgetTracker,
+        final_outcome: str,
+        reason: str | None
+    ):
+        budget_snapshot = tracker.snapshot()
+        final_event = TraceEvent(
+            task_id=task_id,
+            step_idx=step_idx,
+            step_name="final",
+            tool_name="final",
+            params={},
+            status="final",
+            latency_ms=0,
+            error_type=None,
+            injected_fault=None,
+            state_hash="",
+            budget=budget_snapshot["remaining"],
+            recovery_action=None,
+            ts_ms=int(time.time() * 1000),
+            attempt_idx=0,
+            event_type="final",
+            budget_remaining_tokens=budget_snapshot["remaining"]["tokens"],
+            budget_remaining_tool_calls=budget_snapshot["remaining"]["tool_calls"],
+            budget_remaining_time_s=budget_snapshot["remaining"]["time"],
+            budget_used_tokens=budget_snapshot["used"]["tokens"],
+            budget_used_tool_calls=budget_snapshot["used"]["tool_calls"],
+            budget_used_time_s=budget_snapshot["used"]["time"],
+            final_outcome=final_outcome,
+            final_reason=reason,
+            compensation_action=None,
+            saga_stack_depth=0
+        )
+        self.logger.append(final_event)
 
 
 def main():
