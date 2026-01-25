@@ -1,140 +1,158 @@
-import json
 import argparse
-import pandas as pd
+import json
 from collections import defaultdict
 
+FINAL_OUTCOMES = {"success", "escalated", "failed"}
 
-def compute_metrics(traces_path: str, baseline_name: str = None) -> dict:
+
+def _infer_final_outcome(task_events: list[dict], last_step_idx: int) -> str:
+    for event in reversed(task_events):
+        outcome = event.get("final_outcome")
+        if outcome in FINAL_OUTCOMES:
+            return outcome
+
+    final_event = task_events[-1]
+    if final_event.get("recovery_action") == "escalate":
+        return "escalated"
+    if (
+        final_event.get("status") == "ok"
+        and final_event.get("step_idx") == last_step_idx
+    ):
+        return "success"
+    return "failed"
+
+
+def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     """
     从轨迹计算所有指标
-    
-    修复点：
-    - HIR 正确计算为 escalated_tasks / total_tasks
-    - MTTR 从实际延迟累加
-    - RCO 基于实际 tool_calls
+
+    指标定义：
+    - WCR: final_event.status == "ok" 且 final_event.step_idx == last_step
+    - HIR: final outcome 为 escalated 的任务比例
+    - RR_task: 出现过 error 的任务中，最终成功的比例
+    - RR_event: error 事件后系统能继续推进的比例
+    - MTTR: 第一次 error 到最终 success 的延迟累积
+    - CPT/CPS: 单任务/成功任务平均 tool_calls
+    - RCO: max(actual - baseline, 0) / baseline
+    - UAR: AuthDenied/PolicyRejected 的任务比例
     """
-    
-    # 加载轨迹
-    events = []
-    with open(traces_path, 'r') as f:
+
+    events: list[dict] = []
+    with open(traces_path, "r") as f:
         for line in f:
             events.append(json.loads(line))
-    
+
     if not events:
         return {}
-    
-    # 按任务分组
-    tasks = defaultdict(list)
+
+    tasks: dict[str, list[dict]] = defaultdict(list)
     for event in events:
         tasks[event["task_id"]].append(event)
-    
-    # 指标累积器
+
     total_tasks = len(tasks)
     completed_tasks = 0
     escalated_tasks = 0
-    
-    total_errors = 0
-    total_recovered = 0
-    recovery_times = []  # 恢复耗时（从错误到成功的时间差）
-    
-    # 成本指标
-    baseline_tool_calls = 0
-    actual_tool_calls = 0
-    
-    # UAR
+
+    error_tasks = 0
+    recovered_tasks = 0
+
+    total_error_events = 0
+    recovered_error_events = 0
+    recovery_times: list[float] = []
+
+    tool_calls_total = len(events)
+
     tasks_with_auth_issues = 0
-    
-    # 逐任务分析
-    for task_id, task_events in tasks.items():
-        # 理想情况：5 步完成
-        baseline_tool_calls += 5
-        actual_tool_calls += len(task_events)
-        
-        # 检查最终状态
+
+    global_last_step_idx = max(event.get("step_idx", 0) for event in events)
+
+    for task_events in tasks.values():
+        last_step_idx = max(e.get("step_idx", 0) for e in task_events)
         final_event = task_events[-1]
-        
-        # WCR: 成功完成的任务
-        # 判断标准：最后一个事件是 step_idx=4 且 status=ok
-        if final_event["step_idx"] == 4 and final_event["status"] == "ok":
+
+        final_outcome = _infer_final_outcome(task_events, last_step_idx)
+
+        if (
+            final_event.get("status") == "ok"
+            and final_event.get("step_idx") == last_step_idx
+        ):
             completed_tasks += 1
-        
-        # HIR: 升级到人工的任务
-        # 判断标准：有 recovery_action="escalate" 的事件
-        has_escalation = any(
-            e.get("recovery_action") == "escalate" 
-            for e in task_events
-        )
-        if has_escalation:
+
+        if final_outcome == "escalated":
             escalated_tasks += 1
-        
-        # RR: Recovery Rate
-        error_events = [e for e in task_events if e["status"] == "error"]
-        total_errors += len(error_events)
-        
-        # 追踪每个错误是否成功恢复
-        for i, event in enumerate(task_events):
-            if event["status"] == "error":
-                recovery_action = event.get("recovery_action")
-                
-                # 检查是否有后续成功
-                if recovery_action in ["retry", "rollback"]:
-                    # 查找后续同 step 的成功事件
-                    for j in range(i+1, len(task_events)):
-                        next_event = task_events[j]
-                        if (next_event["step_idx"] == event["step_idx"] and 
-                            next_event["status"] == "ok"):
-                            total_recovered += 1
-                            
-                            # MTTR: 计算恢复时间（累加中间所有步骤的延迟）
-                            recovery_latency = sum(
-                                task_events[k]["latency_ms"] 
-                                for k in range(i, j+1)
-                            )
-                            recovery_times.append(recovery_latency)
-                            break
-        
-        # UAR: 权限/策略问题
+
+        error_events = [e for e in task_events if e.get("status") == "error"]
+        if error_events:
+            error_tasks += 1
+            if final_outcome == "success":
+                recovered_tasks += 1
+
+        total_error_events += len(error_events)
+
+        for idx, error_event in enumerate(task_events):
+            if error_event.get("status") != "error":
+                continue
+            error_step = error_event.get("step_idx", 0)
+            recovered = any(
+                later_event.get("status") == "ok"
+                and later_event.get("step_idx", 0) >= error_step
+                for later_event in task_events[idx + 1 :]
+            )
+            if recovered:
+                recovered_error_events += 1
+
+        if error_events and final_outcome == "success":
+            first_error_idx = next(
+                idx for idx, event in enumerate(task_events) if event.get("status") == "error"
+            )
+            recovery_latency = sum(
+                event.get("latency_ms", 0) for event in task_events[first_error_idx:]
+            )
+            recovery_times.append(recovery_latency)
+
         auth_errors = [
-            e for e in error_events 
+            e
+            for e in error_events
             if e.get("error_type") in ["AuthDenied", "PolicyRejected"]
         ]
         if auth_errors:
             tasks_with_auth_issues += 1
-    
-    # 计算最终指标
-    wcr = completed_tasks / total_tasks if total_tasks > 0 else 0
-    rr = total_recovered / total_errors if total_errors > 0 else 0.0
+
+    wcr = completed_tasks / total_tasks if total_tasks else 0.0
+    rr_task = recovered_tasks / error_tasks if error_tasks else 0.0
+    rr_event = (
+        recovered_error_events / total_error_events if total_error_events else 0.0
+    )
     mttr = sum(recovery_times) / len(recovery_times) if recovery_times else 0.0
-    
-    # RCO: Recovery Cost Overhead
-    extra_tool_calls = actual_tool_calls - baseline_tool_calls
-    rco = extra_tool_calls / baseline_tool_calls if baseline_tool_calls > 0 else 0
-    
-    # HIR: Human Intervention Rate
-    hir = escalated_tasks / total_tasks if total_tasks > 0 else 0
-    
-    # UAR: Unauthorized Action Rate
-    uar = tasks_with_auth_issues / total_tasks if total_tasks > 0 else 0
-    
-    metrics = {
+
+    baseline_tool_calls = (global_last_step_idx + 1) * total_tasks
+    extra_tool_calls = max(tool_calls_total - baseline_tool_calls, 0)
+    rco = extra_tool_calls / baseline_tool_calls if baseline_tool_calls else 0.0
+
+    cpt = tool_calls_total / total_tasks if total_tasks else 0.0
+    cps = tool_calls_total / max(completed_tasks, 1)
+
+    hir = escalated_tasks / total_tasks if total_tasks else 0.0
+    uar = tasks_with_auth_issues / total_tasks if total_tasks else 0.0
+
+    return {
         "baseline": baseline_name or "unknown",
         "wcr": wcr,
-        "rr": rr,
-        "mttr": mttr,
-        "rco": rco,
         "hir": hir,
+        "rr_task": rr_task,
+        "rr_event": rr_event,
+        "mttr": mttr,
+        "cpt": cpt,
+        "cps": cps,
+        "rco": rco,
         "uar": uar,
         "total_tasks": total_tasks,
         "completed": completed_tasks,
         "escalated": escalated_tasks,
-        "total_errors": total_errors,
-        "recovered": total_recovered,
+        "tool_calls_total": tool_calls_total,
         "baseline_calls": baseline_tool_calls,
-        "actual_calls": actual_tool_calls,
-        "recovery_count": len(recovery_times)
+        "actual_calls": tool_calls_total,
     }
-    
-    return metrics
 
 
 def print_metrics(metrics: dict):
@@ -142,12 +160,21 @@ def print_metrics(metrics: dict):
     print(f"\n{'='*70}")
     print(f"Metrics for {metrics['baseline']}")
     print(f"{'='*70}")
-    print(f"WCR (Workflow Completion Rate):  {metrics['wcr']:6.2%}  ({metrics['completed']}/{metrics['total_tasks']})")
-    print(f"RR  (Recovery Rate):              {metrics['rr']:6.2%}  ({metrics['recovered']}/{metrics['total_errors']})")
-    print(f"MTTR (Mean Time To Recovery):     {metrics['mttr']:8.1f} ms")
-    print(f"RCO (Recovery Cost Overhead):     {metrics['rco']:6.2%}  (+{metrics['actual_calls']-metrics['baseline_calls']} calls)")
-    print(f"HIR (Human Intervention Rate):    {metrics['hir']:6.2%}  ({metrics['escalated']}/{metrics['total_tasks']})")
-    print(f"UAR (Unauthorized Action Rate):   {metrics['uar']:6.2%}")
+    print(
+        "WCR (Workflow Completion Rate):"
+        f"  {metrics['wcr']:6.2%}  ({metrics['completed']}/{metrics['total_tasks']})"
+    )
+    print(f"RR_task (Recovery Rate):           {metrics['rr_task']:6.2%}")
+    print(f"RR_event (Recovery Rate):          {metrics['rr_event']:6.2%}")
+    print(f"MTTR (Mean Time To Recovery):      {metrics['mttr']:8.1f} ms")
+    print(f"CPS (Cost per Success):            {metrics['cps']:8.2f}")
+    print(f"CPT (Cost per Task):               {metrics['cpt']:8.2f}")
+    print(f"RCO (Recovery Cost Overhead):      {metrics['rco']:6.2%}")
+    print(
+        "HIR (Human Intervention Rate):"
+        f"    {metrics['hir']:6.2%}  ({metrics['escalated']}/{metrics['total_tasks']})"
+    )
+    print(f"UAR (Unauthorized Action Rate):    {metrics['uar']:6.2%}")
     print(f"{'='*70}\n")
 
 
