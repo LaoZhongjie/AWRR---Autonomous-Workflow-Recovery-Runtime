@@ -1,9 +1,9 @@
 import json
 import random
-from state import WorldState
+from constants import SEED
 
 
-def generate_tasks(n: int = 50, seed: int = 42) -> list[dict]:
+def generate_tasks(n: int = 50, seed: int = SEED) -> list[dict]:
     random.seed(seed)
     tasks = []
     

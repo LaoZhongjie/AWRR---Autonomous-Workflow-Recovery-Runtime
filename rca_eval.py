@@ -1,8 +1,12 @@
 import json
 import argparse
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover
+    pd = None
 from collections import defaultdict
 from diagnosis import DiagnosisAgent
+from state import StepContext, StepResult, TraceEvent
 
 
 def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
@@ -15,7 +19,7 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
     
     修复点：
     - 使用 injected_fault.layer_gt 作为真实标签（防泄漏）
-    - 使用 DiagnosisAgent.get_ground_truth_layer(error_type) 作为预测
+    - 使用 DiagnosisAgent(mock) 输出作为预测（与 ground truth 分离）
     - 明确区分 event-level 和 task-level 评估
     """
     
@@ -29,28 +33,62 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
         print("No events found in traces")
         return {}
     
+    diagnosis_agent = DiagnosisAgent(mode="mock")
+
+    # 按任务分组，保持顺序
+    tasks = defaultdict(list)
+    for event in events:
+        tasks[event["task_id"]].append(event)
+
     # 提取有诊断的错误事件
     diagnosed_errors = []
     seen_tasks = set()  # 用于 task-level 去重
     
-    for event in events:
-        if event["status"] == "error" and event.get("injected_fault"):
+    for task_id, task_events in tasks.items():
+        history_events: list[TraceEvent] = []
+        for event in task_events:
+            if event["status"] != "error" or not event.get("injected_fault"):
+                history_events.append(_event_to_trace_event(event))
+                continue
+            diagnosis = event.get("diagnosis") or {}
+            layer_pred = diagnosis.get("layer_pred")
+
             fault_info = event["injected_fault"]
             layer_gt = fault_info.get("layer_gt")
             error_type = event.get("error_type")
             
             if not layer_gt or not error_type:
+                history_events.append(_event_to_trace_event(event))
                 continue
             
             # Task-level: 只取每个任务的第一个错误
             if evaluation_level == "task":
-                task_id = event["task_id"]
                 if task_id in seen_tasks:
+                    history_events.append(_event_to_trace_event(event))
                     continue
                 seen_tasks.add(task_id)
             
-            # 预测层：使用 mock diagnosis 的映射（模拟真实诊断结果）
-            layer_pred = DiagnosisAgent.get_ground_truth_layer(error_type)
+            step_context = StepContext(
+                task_id=event["task_id"],
+                step_idx=event["step_idx"],
+                step_name=event.get("step_name", ""),
+                tool_name=event.get("tool_name", ""),
+                params=event.get("params", {}),
+                state_hash=event.get("state_hash", ""),
+                budget_remaining=event.get("budget", {})
+            )
+            step_result = StepResult(
+                status=event["status"],
+                output=None,
+                error_type=event.get("error_type"),
+                error_msg=event.get("error_msg"),
+                error_trace=event.get("error_trace"),
+                latency_ms=event.get("latency_ms", 0),
+                injected_fault=event.get("injected_fault")
+            )
+            if layer_pred is None:
+                diagnosis = diagnosis_agent.diagnose(step_context, step_result, history_events)
+                layer_pred = diagnosis.layer
             
             diagnosed_errors.append({
                 "task_id": event["task_id"],
@@ -62,6 +100,7 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
                 "recovery_action": event.get("recovery_action"),
                 "matched": layer_gt == layer_pred
             })
+            history_events.append(_event_to_trace_event(event))
     
     if not diagnosed_errors:
         print(f"No diagnosed errors found (evaluation_level={evaluation_level})")
@@ -86,7 +125,7 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
             row[gt_layer] = count
         confusion_matrix.append(row)
     
-    confusion_df = pd.DataFrame(confusion_matrix)
+    confusion_df = pd.DataFrame(confusion_matrix) if pd else confusion_matrix
     
     # 统计
     gt_distribution = defaultdict(int)
@@ -120,6 +159,23 @@ def evaluate_rca(traces_path: str, evaluation_level: str = "event") -> dict:
     return results
 
 
+def _event_to_trace_event(event: dict) -> TraceEvent:
+    return TraceEvent(
+        task_id=event.get("task_id", ""),
+        step_idx=event.get("step_idx", 0),
+        step_name=event.get("step_name", ""),
+        tool_name=event.get("tool_name", ""),
+        params=event.get("params", {}),
+        status=event.get("status", ""),
+        latency_ms=event.get("latency_ms", 0),
+        error_type=event.get("error_type"),
+        injected_fault=event.get("injected_fault"),
+        state_hash=event.get("state_hash", ""),
+        budget=event.get("budget", {}),
+        recovery_action=event.get("recovery_action")
+    )
+
+
 def print_rca_results(results: dict):
     """打印 RCA 评估结果"""
     
@@ -149,7 +205,19 @@ def print_rca_results(results: dict):
         print(f"  {layer:12s}: {count:3d}")
     
     print(f"\nConfusion Matrix (rows=predicted, cols=actual):")
-    print(results['confusion_matrix'].to_string(index=False))
+    if pd is None:
+        headers = ["predicted"] + ["transient", "persistent", "semantic", "cascade"]
+        print(" ".join(f"{h:>10s}" for h in headers))
+        for row in results["confusion_matrix"]:
+            print(
+                f"{row['predicted']:>10s}"
+                f"{row['transient']:>10d}"
+                f"{row['persistent']:>10d}"
+                f"{row['semantic']:>10d}"
+                f"{row['cascade']:>10d}"
+            )
+    else:
+        print(results['confusion_matrix'].to_string(index=False))
     
     print(f"\n" + "="*80)
     print(f"SAMPLE DIAGNOSED ERRORS (first {min(10, len(results['sample_errors']))})")
@@ -173,7 +241,7 @@ def print_rca_results(results: dict):
         print(f"  - Only the first error per task is evaluated")
         print(f"  - Total: {results['total']} tasks with errors")
     print(f"  Ground Truth: injected_fault.layer_gt (from fault injection)")
-    print(f"  Prediction: DiagnosisAgent.get_ground_truth_layer(error_type)")
+    print(f"  Prediction: event.diagnosis.layer_pred (fallback: mock DiagnosisAgent)")
     print("="*80 + "\n")
 
 
