@@ -37,7 +37,7 @@ def generate_leaderboard(traces_paths: dict) -> tuple:
             "WCR": df_raw["wcr"].apply(lambda x: f"{x:.2%}"),
             "RR_task": df_raw["rr_task"].apply(lambda x: f"{x:.2%}"),
             "RR_event": df_raw["rr_event"].apply(lambda x: f"{x:.2%}"),
-            "MTTR (ms)": df_raw["mttr"].apply(lambda x: f"{x:.1f}"),
+            "MTTR (ms)": df_raw["mttr_event"].apply(lambda x: f"{x:.1f}"),
             "CPS": df_raw["cps"].apply(lambda x: f"{x:.2f}"),
             "CPT": df_raw["cpt"].apply(lambda x: f"{x:.2f}"),
             "HIR": df_raw["hir"].apply(lambda x: f"{x:.2%}"),
@@ -66,7 +66,7 @@ def print_analysis(df_raw: pd.DataFrame):
         wcr_delta = (b3["wcr"] - b2["wcr"]) * 100
         rr_task_delta = (b3["rr_task"] - b2["rr_task"]) * 100
         rr_event_delta = (b3["rr_event"] - b2["rr_event"]) * 100
-        mttr_delta = ((b3["mttr"] - b2["mttr"]) / b2["mttr"] * 100) if b2["mttr"] > 0 else 0
+        mttr_delta = ((b3["mttr_event"] - b2["mttr_event"]) / b2["mttr_event"] * 100) if b2["mttr_event"] > 0 else 0
         rco_delta = (b3["rco"] - b2["rco"]) * 100
         hir_delta = (b3["hir"] - b2["hir"]) * 100
         
@@ -92,9 +92,9 @@ def print_analysis(df_raw: pd.DataFrame):
         )
         
         print(f"\nMean Time To Recovery (MTTR):")
-        print(f"  B2: {b2['mttr']:.1f} ms")
-        print(f"  B3: {b3['mttr']:.1f} ms")
-        if b2["mttr"] > 0:
+        print(f"  B2: {b2['mttr_event']:.1f} ms")
+        print(f"  B3: {b3['mttr_event']:.1f} ms")
+        if b2["mttr_event"] > 0:
             print(f"  Δ:  {mttr_delta:+.1f}% {'✓ FASTER' if mttr_delta < 0 else '✗ SLOWER' if mttr_delta > 0 else '= SAME'}")
         
         print(f"\nRecovery Cost Overhead (RCO):")

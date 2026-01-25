@@ -3,6 +3,8 @@ import json
 from collections import defaultdict
 
 FINAL_OUTCOMES = {"success", "escalated", "failed"}
+RECOVERY_ACTIONS = {"retry", "rollback"}
+TOOL_EVENT_TYPES = {"tool_call", "recovery"}
 
 
 def _infer_final_outcome(task_events: list[dict], last_step_idx: int) -> str:
@@ -31,7 +33,7 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     - HIR: final outcome 为 escalated 的任务比例
     - RR_task: 出现过 error 的任务中，最终成功的比例
     - RR_event: error 事件后系统能继续推进的比例
-    - MTTR: 第一次 error 到最终 success 的延迟累积
+    - MTTR_event: error 到首次同 step ok 的平均时间差
     - CPT/CPS: 单任务/成功任务平均 tool_calls
     - RCO: max(actual - baseline, 0) / baseline
     - UAR: AuthDenied/PolicyRejected 的任务比例
@@ -58,30 +60,46 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
 
     total_error_events = 0
     recovered_error_events = 0
-    recovery_times: list[float] = []
+    mttr_event_times: list[float] = []
 
-    tool_calls_total = len(events)
+    tool_events = [
+        event
+        for event in events
+        if event.get("event_type", "tool_call") in TOOL_EVENT_TYPES
+    ]
+    tool_calls_total = len(tool_events)
 
     tasks_with_auth_issues = 0
-
-    global_last_step_idx = max(event.get("step_idx", 0) for event in events)
 
     for task_events in tasks.values():
         last_step_idx = max(e.get("step_idx", 0) for e in task_events)
         final_event = task_events[-1]
+        last_tool_event = next(
+            (
+                event
+                for event in reversed(task_events)
+                if event.get("event_type", "tool_call") in TOOL_EVENT_TYPES
+            ),
+            final_event,
+        )
 
         final_outcome = _infer_final_outcome(task_events, last_step_idx)
 
         if (
-            final_event.get("status") == "ok"
-            and final_event.get("step_idx") == last_step_idx
+            last_tool_event.get("status") == "ok"
+            and last_tool_event.get("step_idx") == last_step_idx
         ):
             completed_tasks += 1
 
         if final_outcome == "escalated":
             escalated_tasks += 1
 
-        error_events = [e for e in task_events if e.get("status") == "error"]
+        error_events = [
+            e
+            for e in task_events
+            if e.get("status") == "error"
+            and e.get("event_type", "tool_call") in TOOL_EVENT_TYPES
+        ]
         if error_events:
             error_tasks += 1
             if final_outcome == "success":
@@ -92,23 +110,26 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         for idx, error_event in enumerate(task_events):
             if error_event.get("status") != "error":
                 continue
+            if error_event.get("recovery_action") not in RECOVERY_ACTIONS:
+                continue
+            if error_event.get("event_type", "tool_call") not in TOOL_EVENT_TYPES:
+                continue
             error_step = error_event.get("step_idx", 0)
-            recovered = any(
-                later_event.get("status") == "ok"
-                and later_event.get("step_idx", 0) >= error_step
-                for later_event in task_events[idx + 1 :]
+            error_ts = error_event.get("ts_ms")
+            recovered_event = next(
+                (
+                    later_event
+                    for later_event in task_events[idx + 1 :]
+                    if later_event.get("status") == "ok"
+                    and later_event.get("step_idx", 0) == error_step
+                    and later_event.get("event_type", "tool_call") in TOOL_EVENT_TYPES
+                ),
+                None,
             )
-            if recovered:
+            if recovered_event:
                 recovered_error_events += 1
-
-        if error_events and final_outcome == "success":
-            first_error_idx = next(
-                idx for idx, event in enumerate(task_events) if event.get("status") == "error"
-            )
-            recovery_latency = sum(
-                event.get("latency_ms", 0) for event in task_events[first_error_idx:]
-            )
-            recovery_times.append(recovery_latency)
+                if error_ts is not None and recovered_event.get("ts_ms") is not None:
+                    mttr_event_times.append(recovered_event["ts_ms"] - error_ts)
 
         auth_errors = [
             e
@@ -123,9 +144,9 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     rr_event = (
         recovered_error_events / total_error_events if total_error_events else 0.0
     )
-    mttr = sum(recovery_times) / len(recovery_times) if recovery_times else 0.0
+    mttr_event = sum(mttr_event_times) / len(mttr_event_times) if mttr_event_times else 0.0
 
-    baseline_tool_calls = (global_last_step_idx + 1) * total_tasks
+    baseline_tool_calls = 5 * total_tasks
     extra_tool_calls = max(tool_calls_total - baseline_tool_calls, 0)
     rco = extra_tool_calls / baseline_tool_calls if baseline_tool_calls else 0.0
 
@@ -141,7 +162,8 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         "hir": hir,
         "rr_task": rr_task,
         "rr_event": rr_event,
-        "mttr": mttr,
+        "mttr_event": mttr_event,
+        "mttr": mttr_event,
         "cpt": cpt,
         "cps": cps,
         "rco": rco,
@@ -166,7 +188,7 @@ def print_metrics(metrics: dict):
     )
     print(f"RR_task (Recovery Rate):           {metrics['rr_task']:6.2%}")
     print(f"RR_event (Recovery Rate):          {metrics['rr_event']:6.2%}")
-    print(f"MTTR (Mean Time To Recovery):      {metrics['mttr']:8.1f} ms")
+    print(f"MTTR_event (Mean Time To Recovery):{metrics['mttr_event']:8.1f} ms")
     print(f"CPS (Cost per Success):            {metrics['cps']:8.2f}")
     print(f"CPT (Cost per Task):               {metrics['cpt']:8.2f}")
     print(f"RCO (Recovery Cost Overhead):      {metrics['rco']:6.2%}")
