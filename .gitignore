@@ -1,17 +1,21 @@
-# 忽略 Python 编译生成的字节码文件
+# macOS 系统文件
+.DS_Store
+**/.DS_Store
+.DS_Store?
+
+# Python 编译文件
 __pycache__/
 *.py[cod]
 *$py.class
 
-# 可选：忽略其他无需上传的 Python 相关文件
-# 虚拟环境目录
+# Python 虚拟环境
 venv/
 env/
-# 依赖包清单（如果不需要共享）
+.venv/
+
+# 其他可选忽略项
 *.egg-info/
 dist/
 build/
-# 日志文件
 *.log
-# 缓存文件
 .pytest_cache/
