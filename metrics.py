@@ -29,8 +29,8 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     从轨迹计算所有指标
 
     指标定义：
-    - WCR: final_event.status == "ok" 且 final_event.step_idx == last_step
-    - HIR: final outcome 为 escalated 的任务比例
+    - WCR: final_outcome == success
+    - HIR: final_outcome == escalated 的任务比例
     - RR_task: 出现过 error 的任务中，最终成功的比例
     - RR_event: error 事件后系统能继续推进的比例
     - MTTR_event: error 到首次同 step ok 的平均时间差
@@ -71,22 +71,9 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     for task_events in tasks.values():
         task_events = sorted(task_events, key=lambda e: e.get("ts_ms", 0))
         last_step_idx = max(e.get("step_idx", 0) for e in task_events)
-        final_event = task_events[-1]
-        last_tool_event = next(
-            (
-                event
-                for event in reversed(task_events)
-                if event.get("event_type", "tool_call") in TOOL_EVENT_TYPES
-            ),
-            final_event,
-        )
-
         final_outcome = _infer_final_outcome(task_events, last_step_idx)
 
-        if (
-            last_tool_event.get("status") == "ok"
-            and last_tool_event.get("step_idx") == last_step_idx
-        ):
+        if final_outcome == "success":
             completed_tasks += 1
 
         if final_outcome == "escalated":

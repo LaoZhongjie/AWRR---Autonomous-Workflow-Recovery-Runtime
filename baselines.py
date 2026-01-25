@@ -304,22 +304,7 @@ class BaselineRunner:
                 return "escalate"
         
         elif self.mode == "B3":
-            # B3: B2 rules + diagnosis only for ambiguous errors
-            if error_type in ["Timeout", "HTTP_500"]:
-                if current_retries < 3:
-                    return "retry"
-                return "escalate"
-            if error_type == "Conflict":
-                if current_retries < 3:
-                    return "rollback_then_retry"
-                return "escalate"
-            if error_type in ["PolicyRejected", "AuthDenied"]:
-                return "escalate"
-            if error_type in ["BadRequest", "NotFound", "StateCorruption"]:
-                return "escalate"
-            if error_type not in ["RuntimeError", "Unknown"]:
-                return "escalate"
-
+            # B3: diagnosis-driven recovery with safety fallback
             if step_context is None or history_events is None:
                 return self._get_recovery_action_b2(result, step_idx, retry_counts)
 
@@ -332,9 +317,18 @@ class BaselineRunner:
             }
             if diagnosis_payload_ref:
                 payload = diagnosis_payload_ref(payload)
+
+            b2_action = self._get_recovery_action_b2(result, step_idx, retry_counts)
+            action = diagnosis.action
             if diagnosis.confidence < 0.7:
-                return "escalate", payload
-            return diagnosis.action, payload
+                action = b2_action
+            elif b2_action == "escalate" and action in ["retry", "rollback"]:
+                action = b2_action
+
+            if action in ["retry", "rollback"] and current_retries >= 3:
+                action = "escalate"
+
+            return action, payload
         
         return "fail"
     
