@@ -1,5 +1,6 @@
 import json
 import random
+import argparse
 from constants import SEED
 
 
@@ -119,13 +120,19 @@ def generate_tasks(n: int = 50, seed: int = SEED) -> list[dict]:
 
 
 if __name__ == "__main__":
-    tasks = generate_tasks(n=100, seed=42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--out", default="tasks.jsonl")
+    args = parser.parse_args()
+
+    tasks = generate_tasks(n=args.n, seed=args.seed)
     
-    with open("tasks.jsonl", 'w') as f:
+    with open(args.out, 'w') as f:
         for task in tasks:
             f.write(json.dumps(task) + '\n')
     
-    print(f"Generated {len(tasks)} tasks -> tasks.jsonl")
+    print(f"Generated {len(tasks)} tasks -> {args.out}")
     
     # 统计故障分布
     fault_dist = {}

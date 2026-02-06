@@ -24,6 +24,13 @@ def _infer_final_outcome(task_events: list[dict], last_step_idx: int) -> str:
         return "success"
     return "failed"
 
+def _normalize_action(action: str | None) -> str | None:
+    if not action:
+        return None
+    if ":" in action:
+        return action.split(":", 1)[1]
+    return action
+
 def _task_call_counts(task_events) -> Tuple[int, int]:
     actual_calls = 0
     seen_steps = set()
@@ -93,6 +100,20 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     tool_calls_total = sum(
         1 for event in events if event.get("event_type", "tool_call") == "tool_call"
     )
+    llm_calls = sum(
+        1
+        for event in events
+        if (event.get("diagnosis") or {}).get("source") in ["diagnosis", "llm"]
+    )
+
+    preventive_events = [e for e in events if e.get("event_type") == "preventive"]
+    preventive_predictions = len(preventive_events)
+    preventive_prevented = sum(
+        1
+        for e in preventive_events
+        if (e.get("diagnosis") or {}).get("prevented") is True
+        or e.get("status") == "prevented"
+    )
 
     rco_base_calls_total = 0
     rco_overhead_calls_total = 0
@@ -139,7 +160,8 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         for idx, error_event in enumerate(task_events):
             if error_event.get("status") != "error":
                 continue
-            if error_event.get("recovery_action") not in RECOVERY_ACTIONS:
+            recovery_action = _normalize_action(error_event.get("recovery_action"))
+            if recovery_action not in RECOVERY_ACTIONS:
                 continue
             if error_event.get("event_type", "tool_call") not in TOOL_EVENT_TYPES:
                 continue
@@ -186,6 +208,10 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     uar = tasks_with_auth_issues / total_tasks if total_tasks else 0.0
     srr = srr_pass_tasks / srr_eligible_tasks if srr_eligible_tasks else 0.0
 
+    preventive_win_rate = (
+        preventive_prevented / preventive_predictions if preventive_predictions else 0.0
+    )
+
     return {
         "baseline": baseline_name or "unknown",
         "wcr": wcr,
@@ -207,6 +233,14 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         "tool_calls_total": tool_calls_total,
         "baseline_calls": rco_base_calls_total,
         "actual_calls": tool_calls_total,
+        "llm_calls": llm_calls,
+        "error_tasks": error_tasks,
+        "recovered_tasks": recovered_tasks,
+        "total_error_events": total_error_events,
+        "recovered_error_events": recovered_error_events,
+        "preventive_predictions": preventive_predictions,
+        "preventive_prevented": preventive_prevented,
+        "preventive_win_rate": preventive_win_rate,
     }
 
 

@@ -1,10 +1,18 @@
 import argparse
+import os
+import re
 from metrics import compute_metrics
 
 try:
     import pandas as pd
 except ModuleNotFoundError:  # pragma: no cover
     pd = None
+
+
+def _infer_label(path: str) -> str:
+    base = os.path.basename(path)
+    match = re.search(r"B\d+", base)
+    return match.group(0) if match else base
 
 
 def generate_leaderboard(traces_paths: dict) -> tuple:
@@ -31,27 +39,36 @@ def generate_leaderboard(traces_paths: dict) -> tuple:
         print("No valid results found")
         return [], []
     
+    llm_calls_map = {item["baseline"]: item.get("llm_calls", 0) for item in results}
+    b3_calls = llm_calls_map.get("B3", 0)
+    llm_reduction_map = {}
+    for item in results:
+        baseline = item["baseline"]
+        if baseline == "B4" and b3_calls:
+            llm_reduction_map[baseline] = (b3_calls - llm_calls_map.get("B4", 0)) / b3_calls
+        else:
+            llm_reduction_map[baseline] = 0.0
+
     if pd is None:
         return results, results
 
     # 转换为 DataFrame
     df_raw = pd.DataFrame(results)
-    
-    # 选择展示列并格式化
+
+    # 选择展示列并格式化 (Phase4)
     display_df = pd.DataFrame(
         {
-            "Baseline": df_raw["baseline"],
-            "WCR": df_raw["wcr"].apply(lambda x: f"{x:.2%}"),
-            "RR_task": df_raw["rr_task"].apply(lambda x: f"{x:.2%}"),
-            "RR_event": df_raw["rr_event"].apply(lambda x: f"{x:.2%}"),
+            "Strategy": df_raw["baseline"],
+            "RR": df_raw["rr_task"].apply(lambda x: f"{x:.2%}"),
             "MTTR (ms)": df_raw["mttr_event"].apply(lambda x: f"{x:.1f}"),
-            "CPS": df_raw["cps"].apply(lambda x: f"{x:.2f}"),
-            "CPT": df_raw["cpt"].apply(lambda x: f"{x:.2f}"),
-            "HIR": df_raw["hir"].apply(lambda x: f"{x:.2%}"),
-            "UAR": df_raw["uar"].apply(lambda x: f"{x:.2%}"),
+            "RCO": df_raw["rco"].apply(lambda x: f"{x:.2%}"),
+            "LLM_Calls": df_raw["llm_calls"].apply(lambda x: f"{int(x)}"),
+            "LLM_Reduction": df_raw["baseline"].apply(
+                lambda b: f"{llm_reduction_map.get(b, 0.0):.2%}" if b == "B4" and b3_calls else "-"
+            ),
         }
     )
-    
+
     return display_df, df_raw
 
 
@@ -68,6 +85,27 @@ def print_analysis(df_raw):
         return df_raw[df_raw["baseline"] == label].iloc[0]
 
     baselines = [row["baseline"] for row in df_raw] if pd is None else df_raw["baseline"].values
+
+    if "B3" in baselines and "B4" in baselines:
+        b3 = _get_row("B3")
+        b4 = _get_row("B4")
+        b3_calls = b3.get("llm_calls", 0)
+        b4_calls = b4.get("llm_calls", 0)
+        llm_reduction = ((b3_calls - b4_calls) / b3_calls) if b3_calls else 0.0
+
+        print(f"\n{'='*80}")
+        print("PRIMARY COMPARISON: B4 (Memory+Diagnosis) vs B3 (Diagnosis)")
+        print(f"{'='*80}")
+        print(f"RR_task: B3={b3['rr_task']:.1%}  B4={b4['rr_task']:.1%}")
+        print(f"MTTR:    B3={b3['mttr_event']:.1f} ms  B4={b4['mttr_event']:.1f} ms")
+        print(f"RCO:     B3={b3['rco']:.1%}  B4={b4['rco']:.1%}")
+        print(f"LLM Calls: B3={b3_calls}  B4={b4_calls}  Reduction={llm_reduction:.1%}")
+        if b4.get("preventive_predictions", 0):
+            print(
+                "Preventive Win Rate:"
+                f" {b4.get('preventive_win_rate', 0.0):.1%}"
+                f" ({b4.get('preventive_prevented', 0)}/{b4.get('preventive_predictions', 0)})"
+            )
 
     if "B2" in baselines and "B3" in baselines:
         b2 = _get_row("B2")
@@ -168,21 +206,27 @@ def print_analysis(df_raw):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--traces", nargs="*", default=None)
     parser.add_argument("--b0", default="traces_B0.jsonl")
     parser.add_argument("--b1", default="traces_B1.jsonl")
     parser.add_argument("--b2", default="traces_B2.jsonl")
     parser.add_argument("--b3", default="traces_B3.jsonl")
+    parser.add_argument("--b4", default="traces_B4.jsonl")
     args = parser.parse_args()
-    
-    traces_paths = {
-        "B0": args.b0,
-        "B1": args.b1,
-        "B2": args.b2,
-        "B3": args.b3
-    }
+
+    if args.traces:
+        traces_paths = {_infer_label(path): path for path in args.traces}
+    else:
+        traces_paths = {
+            "B0": args.b0,
+            "B1": args.b1,
+            "B2": args.b2,
+            "B3": args.b3,
+            "B4": args.b4,
+        }
     
     print("\n" + "="*80)
-    print("AWRR BASELINE LEADERBOARD (Phase 2)")
+    print("AWRR BASELINE LEADERBOARD (Phase 4)")
     print("="*80)
     
     display_df, raw_df = generate_leaderboard(traces_paths)
@@ -195,19 +239,24 @@ if __name__ == "__main__":
     if has_results:
         print("\n")
         if pd is None:
-            headers = ["Baseline", "WCR", "RR_task", "RR_event", "MTTR (ms)", "CPS", "CPT", "HIR", "UAR"]
-            print(" ".join(f"{h:>10s}" for h in headers))
-            for row in display_df:
+            b3_calls = 0
+            for row in raw_df:
+                if row["baseline"] == "B3":
+                    b3_calls = row.get("llm_calls", 0)
+                    break
+            headers = ["Strategy", "RR", "MTTR(ms)", "RCO", "LLM_Calls", "LLM_Reduction"]
+            print(" ".join(f"{h:>12s}" for h in headers))
+            for row in raw_df:
+                reduction = "-"
+                if row["baseline"] == "B4" and b3_calls:
+                    reduction = f"{(b3_calls - row.get('llm_calls', 0)) / b3_calls:.2%}"
                 print(
-                    f"{row['baseline']:>10s}"
-                    f"{row['wcr']:>10.2%}"
-                    f"{row['rr_task']:>10.2%}"
-                    f"{row['rr_event']:>10.2%}"
-                    f"{row['mttr_event']:>10.1f}"
-                    f"{row['cps']:>10.2f}"
-                    f"{row['cpt']:>10.2f}"
-                    f"{row['hir']:>10.2%}"
-                    f"{row['uar']:>10.2%}"
+                    f"{row['baseline']:>12s}"
+                    f"{row['rr_task']:>12.2%}"
+                    f"{row['mttr_event']:>12.1f}"
+                    f"{row['rco']:>12.2%}"
+                    f"{int(row.get('llm_calls', 0)):>12d}"
+                    f"{reduction:>12s}"
                 )
         else:
             print(display_df.to_string(index=False))

@@ -2,11 +2,22 @@ import json
 import time
 import argparse
 import random
+from dataclasses import dataclass
+from typing import Optional
+
 from state import WorldState, Budget, TraceEvent, StepContext
 from trace_logger import TraceLogger
 from oracle_checker import check_success
 import mock_api
 from constants import SEED
+from learning import FaultSignature, MemoryBank, predict_potential_failure
+
+
+@dataclass
+class RecoveryDecision:
+    action: str
+    payload: dict
+    source: str  # rule | diagnosis | memory
 
 
 class BudgetTracker:
@@ -45,27 +56,46 @@ class BudgetTracker:
 
 
 class BaselineRunner:
-    def __init__(self, mode: str, seed: int = SEED, diagnosis_mode: str = "mock"):
+    def __init__(
+        self,
+        mode: str,
+        seed: int = SEED,
+        diagnosis_mode: str = "mock",
+        memory_path: Optional[str] = None,
+        memory_threshold: float = 0.8,
+        preventive_threshold: float = 0.75,
+    ):
         """
         Args:
-            mode: "B0" | "B1" | "B2" | "B3"
+            mode: "B0" | "B1" | "B2" | "B3" | "B4"
             seed: Random seed for reproducibility
-            diagnosis_mode: "mock" | "llm" (only for B3)
+            diagnosis_mode: "mock" | "llm" (for B3/B4)
+            memory_path: optional path to memory bank JSON (for B4)
         """
-        if mode not in ["B0", "B1", "B2", "B3"]:
+        if mode not in ["B0", "B1", "B2", "B3", "B4"]:
             raise ValueError(f"Invalid mode: {mode}")
-        
+
         self.mode = mode
         self.logger = TraceLogger()
         self.seed = seed
         random.seed(seed)
-        
-        # B3: Initialize diagnosis agent
-        if mode == "B3":
+        self.llm_calls = 0
+        self.preventive_predictions = 0
+        self.preventive_prevented = 0
+        self.memory_threshold = memory_threshold
+        self.preventive_threshold = preventive_threshold
+
+        # B3/B4: Initialize diagnosis agent
+        if mode in ["B3", "B4"]:
             from diagnosis import DiagnosisAgent
             self.diagnosis_agent = DiagnosisAgent(mode=diagnosis_mode)
         else:
             self.diagnosis_agent = None
+
+        # B4: Initialize memory bank
+        self.memory_bank = None
+        if mode == "B4":
+            self.memory_bank = MemoryBank(memory_path)
     
     def run_task(self, task: dict) -> dict:
         """执行单个任务"""
@@ -92,6 +122,8 @@ class BaselineRunner:
         
         checkpoint = world_state.deep_copy()
         retry_counts = {}
+        first_failure_signature: Optional[FaultSignature] = None
+        first_failure_action: Optional[str] = None
         
         step_idx = 0
         while step_idx < len(steps):
@@ -104,6 +136,18 @@ class BaselineRunner:
             tool_name = step["tool_name"]
             params = step["params"]
             attempt_idx = retry_counts.get(step_idx, 0)
+            state_hash_pre = world_state.compute_hash()
+
+            # StepContext before execution (for preventive checks)
+            pre_step_context = StepContext(
+                task_id=task_id,
+                step_idx=step_idx,
+                step_name=step["step_name"],
+                tool_name=tool_name,
+                params=params,
+                state_hash=state_hash_pre,
+                budget_remaining=tracker.check_budget()
+            )
             
             # 查找故障注入
             fault_injection = None
@@ -115,6 +159,75 @@ class BaselineRunner:
                     if injected:
                         fault_injection = injected
                     break
+
+            # B4: 预防性预测（基于 memory）
+            if self.mode == "B4" and self.memory_bank is not None:
+                predicted_sig = FaultSignature.from_planned_fault(
+                    pre_step_context, fault_injection
+                )
+                decision = predict_potential_failure(
+                    predicted_sig, self.memory_bank, threshold=self.preventive_threshold
+                )
+                if decision.predicted:
+                    self.preventive_predictions += 1
+                    prevented = decision.action in ["escalate", "compensate"]
+                    if prevented:
+                        self.preventive_prevented += 1
+
+                    budget_snapshot = tracker.snapshot()
+                    prevent_event = TraceEvent(
+                        task_id=task_id,
+                        step_idx=step_idx,
+                        step_name=step["step_name"],
+                        tool_name=tool_name,
+                        params=params,
+                        status="prevented" if prevented else "predicted",
+                        latency_ms=0,
+                        error_type=predicted_sig.error_type if predicted_sig else None,
+                        injected_fault=fault_injection,
+                        state_hash=state_hash_pre,
+                        budget=budget_snapshot["remaining"],
+                        recovery_action=f"prevent:{decision.action}",
+                        ts_ms=int(time.time() * 1000),
+                        attempt_idx=attempt_idx,
+                        event_type="preventive",
+                        budget_remaining_tokens=budget_snapshot["remaining"]["tokens"],
+                        budget_remaining_tool_calls=budget_snapshot["remaining"]["tool_calls"],
+                        budget_remaining_time_s=budget_snapshot["remaining"]["time"],
+                        budget_used_tokens=budget_snapshot["used"]["tokens"],
+                        budget_used_tool_calls=budget_snapshot["used"]["tool_calls"],
+                        budget_used_time_s=budget_snapshot["used"]["time"],
+                        compensation_action=None,
+                        saga_stack_depth=0,
+                        diagnosis={
+                            "layer_pred": None,
+                            "action_pred": decision.action,
+                            "confidence": decision.confidence,
+                            "rationale_short": decision.note,
+                            "source": "memory",
+                            "signature": predicted_sig.to_key() if predicted_sig else None,
+                            "matched_key": decision.matched_key,
+                            "predicted": True,
+                            "prevented": prevented,
+                        }
+                    )
+                    self.logger.append(prevent_event)
+
+                    if prevented:
+                        self._escalate_human(
+                            task_id, step_idx,
+                            f"prevented_{decision.action}",
+                            world_state, tracker
+                        )
+                        self._append_final_event(
+                            task_id, step_idx, tracker, "escalated",
+                            f"prevented_{decision.action}"
+                        )
+                        return {
+                            "task_id": task_id,
+                            "status": "escalated",
+                            "reason": f"prevented_{decision.action}"
+                        }
             
             # 执行工具
             result = self._execute_step(world_state, tool_name, params, fault_injection)
@@ -172,65 +285,62 @@ class BaselineRunner:
                 step_idx += 1
             else:
                 # 根据 baseline 模式选择恢复策略
-                diagnosis_payload = {
-                    "layer_pred": None,
-                    "action_pred": None,
-                    "confidence": None,
-                    "rationale_short": None
-                }
-                recovery_action = self._get_recovery_action(
+                fault_signature = FaultSignature.from_failure(step_context, result)
+                if first_failure_signature is None:
+                    first_failure_signature = fault_signature
+
+                decision = self._get_recovery_action(
                     result, step_idx, retry_counts, world_state, checkpoint,
                     step_context=step_context,
                     history_events=self.logger.events,
-                    diagnosis_payload_ref=lambda payload: payload
+                    fault_signature=fault_signature
                 )
-                if isinstance(recovery_action, tuple):
-                    recovery_action, diagnosis_payload = recovery_action
-                if diagnosis_payload["layer_pred"] is None:
-                    default_layer = "semantic" if result.error_type in ["PolicyRejected", "AuthDenied", "BadRequest"] else "persistent"
-                    diagnosis_payload = {
-                        "layer_pred": default_layer,
-                        "action_pred": recovery_action,
-                        "confidence": 0.5,
-                        "rationale_short": "rule-based fallback"
-                    }
-                event.recovery_action = recovery_action
-                event.diagnosis = diagnosis_payload
+                action = decision.action
+                payload = decision.payload
+
+                recovery_label = action
+                if self.mode == "B4" and decision.source in ["memory", "diagnosis"]:
+                    recovery_label = f"{decision.source}:{action}"
+                event.recovery_action = recovery_label
+                event.diagnosis = payload
                 self.logger.append(event)
-                
-                if recovery_action == "fail":
+
+                if first_failure_action is None:
+                    first_failure_action = action
+
+                if action == "fail":
                     self._append_final_event(task_id, step_idx, tracker, "failed", result.error_type)
                     return {"task_id": task_id, "status": "failed", "reason": result.error_type}
                 
-                elif recovery_action == "escalate":
+                elif action == "escalate":
                     self._escalate_human(task_id, step_idx, result.error_type, world_state, tracker)
                     self._append_final_event(task_id, step_idx, tracker, "escalated", result.error_type)
                     return {"task_id": task_id, "status": "escalated", "reason": result.error_type}
                 
-                elif recovery_action == "retry":
+                elif action == "retry":
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     if self.mode == "B1":
                         time.sleep(0.05)
-                    elif self.mode in ["B2", "B3"]:
+                    elif self.mode in ["B2", "B3", "B4"]:
                         backoff = 0.1 * (2 ** (retry_counts[step_idx] - 1))
                         time.sleep(min(backoff, 0.4))
                     continue
                 
-                elif recovery_action == "rollback_then_retry":
+                elif action == "rollback_then_retry":
                     world_state.records = checkpoint.records.copy()
                     world_state.inventory = checkpoint.inventory.copy()
                     world_state.audit_log = checkpoint.audit_log.copy()
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
                 
-                elif recovery_action == "rollback":
+                elif action == "rollback":
                     world_state.records = checkpoint.records.copy()
                     world_state.inventory = checkpoint.inventory.copy()
                     world_state.audit_log = checkpoint.audit_log.copy()
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
                 
-                elif recovery_action == "compensate":
+                elif action == "compensate":
                     # B3 可能返回 compensate，暂时视为 escalate
                     self._escalate_human(task_id, step_idx, result.error_type, world_state, tracker)
                     self._append_final_event(task_id, step_idx, tracker, "escalated", "compensate_needed")
@@ -238,6 +348,13 @@ class BaselineRunner:
         
         # 检查成功
         success = check_success(world_state, task)
+        if self.mode == "B4" and self.memory_bank is not None:
+            if first_failure_signature is not None and first_failure_action is not None:
+                self.memory_bank.upsert(
+                    first_failure_signature,
+                    first_failure_action,
+                    success=success,
+                )
         final_outcome = "success" if success else "failed"
         self._append_final_event(task_id, len(steps) - 1, tracker, final_outcome, None)
         return {
@@ -268,75 +385,155 @@ class BaselineRunner:
         
         return tool_func(world_state, **params, fault_injection=fault_injection)
     
-    def _get_recovery_action(self, result, step_idx: int, retry_counts: dict, 
-                            world_state: WorldState, checkpoint: WorldState,
-                            step_context: StepContext = None,
-                            history_events: list = None,
-                            diagnosis_payload_ref=None) -> str | tuple[str, dict]:
+    def _default_payload(self, error_type: str, action: str, source: str, note: str) -> dict:
+        default_layer = (
+            "semantic"
+            if error_type in ["PolicyRejected", "AuthDenied", "BadRequest"]
+            else "persistent"
+        )
+        return {
+            "layer_pred": default_layer,
+            "action_pred": action,
+            "confidence": 0.5,
+            "rationale_short": note,
+            "source": source,
+        }
+
+    def _apply_safety_guard(
+        self,
+        action: str,
+        current_retries: int,
+        step_context: Optional[StepContext],
+    ) -> str:
+        if step_context and step_context.budget_remaining.get("tool_calls", 0) <= 1:
+            if action in ["retry", "rollback"]:
+                return "escalate"
+        if action in ["retry", "rollback"] and current_retries >= 3:
+            return "escalate"
+        return action
+
+    def _get_recovery_action(
+        self,
+        result,
+        step_idx: int,
+        retry_counts: dict,
+        world_state: WorldState,
+        checkpoint: WorldState,
+        step_context: StepContext | None = None,
+        history_events: list | None = None,
+        fault_signature: Optional[FaultSignature] = None,
+    ) -> RecoveryDecision:
         """根据 baseline 模式决定恢复动作"""
         error_type = result.error_type
         current_retries = retry_counts.get(step_idx, 0)
-        
+        b2_action = self._get_recovery_action_b2(result, step_idx, retry_counts)
+
         if self.mode == "B0":
-            # B0: No Recovery - 任何错误都失败
-            return "fail"
-        
-        elif self.mode == "B1":
-            # B1: Naive Retry - 不区分错误类型，统一重试 <=3 次
-            if current_retries < 3:
-                return "retry"
-            else:
-                return "fail"
-        
-        elif self.mode == "B2":
-            # B2: Rule-Based Recovery
-            if error_type in ["Timeout", "HTTP_500"]:
-                if current_retries < 3:
-                    return "retry"
-                else:
-                    return "escalate"
-            elif error_type == "Conflict":
-                if current_retries < 3:
-                    return "rollback"
-                else:
-                    return "escalate"
-            elif error_type in ["PolicyRejected", "AuthDenied"]:
-                return "escalate"
-            elif error_type in ["BadRequest", "NotFound", "StateCorruption"]:
-                return "escalate"
-            else:
-                return "escalate"
-        
-        elif self.mode == "B3":
-            # B3: diagnosis-driven recovery with safety fallback
+            return RecoveryDecision(
+                "fail",
+                self._default_payload(error_type, "fail", "rule", "no-recovery"),
+                "rule",
+            )
+
+        if self.mode == "B1":
+            action = "retry" if current_retries < 3 else "fail"
+            return RecoveryDecision(
+                action,
+                self._default_payload(error_type, action, "rule", "naive-retry"),
+                "rule",
+            )
+
+        if self.mode == "B2":
+            return RecoveryDecision(
+                b2_action,
+                self._default_payload(error_type, b2_action, "rule", "rule-based"),
+                "rule",
+            )
+
+        if self.mode == "B3":
+            # diagnosis-driven recovery with safety fallback
             if step_context is None or history_events is None:
-                return self._get_recovery_action_b2(result, step_idx, retry_counts)
+                return RecoveryDecision(
+                    b2_action,
+                    self._default_payload(error_type, b2_action, "rule", "missing-context"),
+                    "rule",
+                )
 
             diagnosis = self.diagnosis_agent.diagnose(step_context, result, history_events)
+            self.llm_calls += 1
             payload = {
                 "layer_pred": diagnosis.layer,
                 "action_pred": diagnosis.action,
                 "confidence": diagnosis.confidence,
-                "rationale_short": diagnosis.reasoning[:120]
+                "rationale_short": diagnosis.reasoning[:120],
+                "source": "diagnosis",
             }
-            if diagnosis_payload_ref:
-                payload = diagnosis_payload_ref(payload)
 
-            b2_action = self._get_recovery_action_b2(result, step_idx, retry_counts)
             action = diagnosis.action
             if diagnosis.confidence < 0.7:
                 action = b2_action
-            else:
-                # Safety guard: if budget is almost exhausted, prefer escalation over risky retries/rollbacks
-                if step_context.budget_remaining.get("tool_calls", 0) <= 1 and action in ["retry", "rollback"]:
-                    action = "escalate"
+                payload["rationale_short"] = "diagnosis_low_confidence_fallback"
+                payload["fallback_action"] = b2_action
 
-            if action in ["retry", "rollback"] and current_retries >= 3:
-                action = "escalate"
+            guarded = self._apply_safety_guard(action, current_retries, step_context)
+            if guarded != action:
+                payload["final_action"] = guarded
+            return RecoveryDecision(guarded, payload, "diagnosis")
 
-            return action, payload
-        
-        return "fail"
+        if self.mode == "B4":
+            if step_context is None or history_events is None:
+                return RecoveryDecision(
+                    b2_action,
+                    self._default_payload(error_type, b2_action, "rule", "missing-context"),
+                    "rule",
+                )
+
+            if self.memory_bank is not None and fault_signature is not None:
+                mem_action, mem_conf, matched_key = self.memory_bank.query(
+                    fault_signature
+                )
+                if mem_action and mem_conf >= self.memory_threshold:
+                    payload = {
+                        "layer_pred": None,
+                        "action_pred": mem_action,
+                        "confidence": mem_conf,
+                        "rationale_short": "memory-hit",
+                        "source": "memory",
+                        "signature": fault_signature.to_key(),
+                        "matched_key": matched_key,
+                    }
+                    guarded = self._apply_safety_guard(
+                        mem_action, current_retries, step_context
+                    )
+                    if guarded != mem_action:
+                        payload["final_action"] = guarded
+                        payload["overridden"] = True
+                    return RecoveryDecision(guarded, payload, "memory")
+
+            diagnosis = self.diagnosis_agent.diagnose(step_context, result, history_events)
+            self.llm_calls += 1
+            payload = {
+                "layer_pred": diagnosis.layer,
+                "action_pred": diagnosis.action,
+                "confidence": diagnosis.confidence,
+                "rationale_short": diagnosis.reasoning[:120],
+                "source": "diagnosis",
+            }
+            action = diagnosis.action
+            if diagnosis.confidence < 0.7:
+                action = b2_action
+                payload["rationale_short"] = "diagnosis_low_confidence_fallback"
+                payload["fallback_action"] = b2_action
+            guarded = self._apply_safety_guard(action, current_retries, step_context)
+            if guarded != action:
+                payload["final_action"] = guarded
+            return RecoveryDecision(guarded, payload, "diagnosis")
+
+        return RecoveryDecision(
+            "fail",
+            self._default_payload(error_type, "fail", "rule", "fallback"),
+            "rule",
+        )
     
     def _get_recovery_action_b2(self, result, step_idx: int, retry_counts: dict) -> str:
         """B2 logic for fallback"""
@@ -406,9 +603,19 @@ class BaselineRunner:
         self.logger.append(final_event)
 
 
-def run(tasks_path: str, mode: str, seed: int = SEED, diagnosis_mode: str = "mock") -> str:
+def run(
+    tasks_path: str,
+    mode: str,
+    seed: int = SEED,
+    diagnosis_mode: str = "mock",
+    out_path: Optional[str] = None,
+    memory_path: Optional[str] = None,
+) -> str:
     """运行 baseline 实验"""
     
+    if mode == "B4" and memory_path is None:
+        memory_path = "memory_bank.json"
+
     # 加载任务
     tasks = []
     with open(tasks_path, 'r') as f:
@@ -416,7 +623,7 @@ def run(tasks_path: str, mode: str, seed: int = SEED, diagnosis_mode: str = "moc
             tasks.append(json.loads(line))
     
     print(f"\n{'='*60}")
-    if mode == "B3":
+    if mode in ["B3", "B4"]:
         print(f"Running Baseline: {mode} (diagnosis_mode={diagnosis_mode})")
     else:
         print(f"Running Baseline: {mode}")
@@ -427,7 +634,12 @@ def run(tasks_path: str, mode: str, seed: int = SEED, diagnosis_mode: str = "moc
     random.seed(seed)
     
     # 运行任务
-    runner = BaselineRunner(mode=mode, seed=seed, diagnosis_mode=diagnosis_mode)
+    runner = BaselineRunner(
+        mode=mode,
+        seed=seed,
+        diagnosis_mode=diagnosis_mode,
+        memory_path=memory_path,
+    )
     results = []
     
     for i, task in enumerate(tasks):
@@ -438,7 +650,7 @@ def run(tasks_path: str, mode: str, seed: int = SEED, diagnosis_mode: str = "moc
         print(f"[{i+1:2d}/{len(tasks)}] {status_symbol} {result['task_id']}: {result['status']}")
     
     # 保存轨迹
-    traces_path = f"traces_{mode}.jsonl"
+    traces_path = out_path or f"traces_{mode}.jsonl"
     runner.logger.flush_jsonl(traces_path)
     
     # 统计
@@ -451,6 +663,13 @@ def run(tasks_path: str, mode: str, seed: int = SEED, diagnosis_mode: str = "moc
     print(f"  Success:   {success_count:2d}/{len(tasks)} ({success_count/len(tasks)*100:.1f}%)")
     print(f"  Failed:    {failed_count:2d}/{len(tasks)} ({failed_count/len(tasks)*100:.1f}%)")
     print(f"  Escalated: {escalated_count:2d}/{len(tasks)} ({escalated_count/len(tasks)*100:.1f}%)")
+    if mode in ["B3", "B4"]:
+        print(f"  LLM Diagnose Calls: {runner.llm_calls}")
+    if mode == "B4":
+        print(f"  Preventive Predictions: {runner.preventive_predictions}")
+        print(f"  Preventive Prevented:   {runner.preventive_prevented}")
+        if memory_path:
+            print(f"  Memory Bank: {memory_path}")
     print(f"{'='*60}\n")
     
     return traces_path
@@ -459,10 +678,19 @@ def run(tasks_path: str, mode: str, seed: int = SEED, diagnosis_mode: str = "moc
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", default="tasks.jsonl")
-    parser.add_argument("--mode", choices=["B0", "B1", "B2", "B3"], required=True)
+    parser.add_argument("--mode", choices=["B0", "B1", "B2", "B3", "B4"], required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--diagnosis-mode", choices=["mock", "llm"], default="mock")
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--memory", default=None)
     args = parser.parse_args()
     
-    traces_path = run(args.tasks, args.mode, args.seed, args.diagnosis_mode)
+    traces_path = run(
+        args.tasks,
+        args.mode,
+        args.seed,
+        args.diagnosis_mode,
+        out_path=args.out,
+        memory_path=args.memory,
+    )
     print(f"Traces saved to: {traces_path}")
