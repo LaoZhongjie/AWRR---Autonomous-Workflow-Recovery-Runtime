@@ -106,15 +106,6 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         if (event.get("diagnosis") or {}).get("source") in ["diagnosis", "llm"]
     )
 
-    preventive_events = [e for e in events if e.get("event_type") == "preventive"]
-    preventive_predictions = len(preventive_events)
-    preventive_prevented = sum(
-        1
-        for e in preventive_events
-        if (e.get("diagnosis") or {}).get("prevented") is True
-        or e.get("status") == "prevented"
-    )
-
     rco_base_calls_total = 0
     rco_overhead_calls_total = 0
 
@@ -208,10 +199,6 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     uar = tasks_with_auth_issues / total_tasks if total_tasks else 0.0
     srr = srr_pass_tasks / srr_eligible_tasks if srr_eligible_tasks else 0.0
 
-    preventive_win_rate = (
-        preventive_prevented / preventive_predictions if preventive_predictions else 0.0
-    )
-
     return {
         "baseline": baseline_name or "unknown",
         "wcr": wcr,
@@ -238,9 +225,6 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         "recovered_tasks": recovered_tasks,
         "total_error_events": total_error_events,
         "recovered_error_events": recovered_error_events,
-        "preventive_predictions": preventive_predictions,
-        "preventive_prevented": preventive_prevented,
-        "preventive_win_rate": preventive_win_rate,
     }
 
 

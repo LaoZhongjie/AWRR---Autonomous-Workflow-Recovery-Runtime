@@ -100,12 +100,6 @@ def print_analysis(df_raw):
         print(f"MTTR:    B3={b3['mttr_event']:.1f} ms  B4={b4['mttr_event']:.1f} ms")
         print(f"RCO:     B3={b3['rco']:.1%}  B4={b4['rco']:.1%}")
         print(f"LLM Calls: B3={b3_calls}  B4={b4_calls}  Reduction={llm_reduction:.1%}")
-        if b4.get("preventive_predictions", 0):
-            print(
-                "Preventive Win Rate:"
-                f" {b4.get('preventive_win_rate', 0.0):.1%}"
-                f" ({b4.get('preventive_prevented', 0)}/{b4.get('preventive_predictions', 0)})"
-            )
 
     if "B2" in baselines and "B3" in baselines:
         b2 = _get_row("B2")

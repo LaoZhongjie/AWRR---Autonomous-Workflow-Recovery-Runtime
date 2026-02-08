@@ -10,7 +10,7 @@ from trace_logger import TraceLogger
 from oracle_checker import check_success
 import mock_api
 from constants import SEED
-from learning import FaultSignature, MemoryBank, predict_potential_failure
+from learning import FaultSignature, MemoryBank
 
 
 @dataclass
@@ -63,7 +63,6 @@ class BaselineRunner:
         diagnosis_mode: str = "mock",
         memory_path: Optional[str] = None,
         memory_threshold: float = 0.8,
-        preventive_threshold: float = 0.75,
     ):
         """
         Args:
@@ -80,10 +79,7 @@ class BaselineRunner:
         self.seed = seed
         random.seed(seed)
         self.llm_calls = 0
-        self.preventive_predictions = 0
-        self.preventive_prevented = 0
         self.memory_threshold = memory_threshold
-        self.preventive_threshold = preventive_threshold
 
         # B3/B4: Initialize diagnosis agent
         if mode in ["B3", "B4"]:
@@ -137,17 +133,6 @@ class BaselineRunner:
             params = step["params"]
             attempt_idx = retry_counts.get(step_idx, 0)
             state_hash_pre = world_state.compute_hash()
-
-            # StepContext before execution (for preventive checks)
-            pre_step_context = StepContext(
-                task_id=task_id,
-                step_idx=step_idx,
-                step_name=step["step_name"],
-                tool_name=tool_name,
-                params=params,
-                state_hash=state_hash_pre,
-                budget_remaining=tracker.check_budget()
-            )
             
             # 查找故障注入
             fault_injection = None
@@ -160,75 +145,6 @@ class BaselineRunner:
                         fault_injection = injected
                     break
 
-            # B4: 预防性预测（基于 memory）
-            if self.mode == "B4" and self.memory_bank is not None:
-                predicted_sig = FaultSignature.from_planned_fault(
-                    pre_step_context, fault_injection
-                )
-                decision = predict_potential_failure(
-                    predicted_sig, self.memory_bank, threshold=self.preventive_threshold
-                )
-                if decision.predicted:
-                    self.preventive_predictions += 1
-                    prevented = decision.action in ["escalate", "compensate"]
-                    if prevented:
-                        self.preventive_prevented += 1
-
-                    budget_snapshot = tracker.snapshot()
-                    prevent_event = TraceEvent(
-                        task_id=task_id,
-                        step_idx=step_idx,
-                        step_name=step["step_name"],
-                        tool_name=tool_name,
-                        params=params,
-                        status="prevented" if prevented else "predicted",
-                        latency_ms=0,
-                        error_type=predicted_sig.error_type if predicted_sig else None,
-                        injected_fault=fault_injection,
-                        state_hash=state_hash_pre,
-                        budget=budget_snapshot["remaining"],
-                        recovery_action=f"prevent:{decision.action}",
-                        ts_ms=int(time.time() * 1000),
-                        attempt_idx=attempt_idx,
-                        event_type="preventive",
-                        budget_remaining_tokens=budget_snapshot["remaining"]["tokens"],
-                        budget_remaining_tool_calls=budget_snapshot["remaining"]["tool_calls"],
-                        budget_remaining_time_s=budget_snapshot["remaining"]["time"],
-                        budget_used_tokens=budget_snapshot["used"]["tokens"],
-                        budget_used_tool_calls=budget_snapshot["used"]["tool_calls"],
-                        budget_used_time_s=budget_snapshot["used"]["time"],
-                        compensation_action=None,
-                        saga_stack_depth=0,
-                        diagnosis={
-                            "layer_pred": None,
-                            "action_pred": decision.action,
-                            "confidence": decision.confidence,
-                            "rationale_short": decision.note,
-                            "source": "memory",
-                            "signature": predicted_sig.to_key() if predicted_sig else None,
-                            "matched_key": decision.matched_key,
-                            "predicted": True,
-                            "prevented": prevented,
-                        }
-                    )
-                    self.logger.append(prevent_event)
-
-                    if prevented:
-                        self._escalate_human(
-                            task_id, step_idx,
-                            f"prevented_{decision.action}",
-                            world_state, tracker
-                        )
-                        self._append_final_event(
-                            task_id, step_idx, tracker, "escalated",
-                            f"prevented_{decision.action}"
-                        )
-                        return {
-                            "task_id": task_id,
-                            "status": "escalated",
-                            "reason": f"prevented_{decision.action}"
-                        }
-            
             # 执行工具
             result = self._execute_step(world_state, tool_name, params, fault_injection)
             
@@ -666,8 +582,6 @@ def run(
     if mode in ["B3", "B4"]:
         print(f"  LLM Diagnose Calls: {runner.llm_calls}")
     if mode == "B4":
-        print(f"  Preventive Predictions: {runner.preventive_predictions}")
-        print(f"  Preventive Prevented:   {runner.preventive_prevented}")
         if memory_path:
             print(f"  Memory Bank: {memory_path}")
     print(f"{'='*60}\n")

@@ -56,29 +56,6 @@ class FaultSignature:
             state_hash_prefix=prefix,
         )
 
-    @staticmethod
-    def from_planned_fault(
-        step_context: StepContext,
-        fault_injection: Optional[dict],
-        top_k: int = 5,
-    ) -> Optional["FaultSignature"]:
-        """
-        Build a predicted signature from a known planned fault (before execution).
-        """
-        if not fault_injection:
-            return None
-        fault_type = fault_injection.get("fault_type", "Unknown")
-        error_text = fault_type
-        keywords = _extract_keywords(error_text, k=top_k)
-        prefix = (step_context.state_hash or "")[:10]
-        return FaultSignature(
-            tool_name=step_context.tool_name,
-            error_type=fault_type,
-            step_name=step_context.step_name,
-            topK_error_keywords=tuple(keywords),
-            state_hash_prefix=prefix,
-        )
-
     def to_key(self) -> str:
         kw = ",".join(self.topK_error_keywords)
         return f"{self.tool_name}|{self.error_type}|{self.step_name}|{self.state_hash_prefix}|{kw}"
@@ -202,35 +179,3 @@ class MemoryBank:
         if sig.state_hash_prefix == stored.get("state_hash_prefix"):
             score += 0.1
         return score
-
-
-@dataclass
-class PreventiveDecision:
-    predicted: bool
-    confidence: float
-    action: Optional[str]
-    note: str
-    matched_key: Optional[str] = None
-
-
-def predict_potential_failure(
-    signature: Optional[FaultSignature],
-    memory_bank: Optional[MemoryBank],
-    threshold: float = 0.85,
-) -> PreventiveDecision:
-    """
-    Predict and attempt to avoid an imminent failure using MemoryBank.
-    """
-    if signature is None or memory_bank is None:
-        return PreventiveDecision(False, 0.0, None, "no-signature")
-
-    action, confidence, matched_key = memory_bank.query(signature)
-    if action and confidence >= threshold:
-        return PreventiveDecision(
-            predicted=True,
-            confidence=confidence,
-            action=action,
-            note="memory_predicted_failure",
-            matched_key=matched_key,
-        )
-    return PreventiveDecision(False, confidence, action, "low-confidence", matched_key)
