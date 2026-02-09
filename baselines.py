@@ -139,7 +139,7 @@ class BaselineRunner:
             for fi in fault_injections:
                 if fi["step_idx"] == step_idx:
                     injected = mock_api.FaultInjector.should_inject(
-                        fi, step_idx, task_id, world_state
+                        fi, step_idx, task_id, world_state, attempt_idx
                     )
                     if injected:
                         fault_injection = injected
@@ -243,16 +243,23 @@ class BaselineRunner:
                     continue
                 
                 elif action == "rollback_then_retry":
-                    world_state.records = checkpoint.records.copy()
-                    world_state.inventory = checkpoint.inventory.copy()
-                    world_state.audit_log = checkpoint.audit_log.copy()
+                    # Internal rollback: deep-copy checkpoint state and record rollback in audit_log
+                    # (used by stateful faults that clear on rollback observation)
+                    world_state.records = json.loads(json.dumps(checkpoint.records))
+                    world_state.inventory = json.loads(json.dumps(checkpoint.inventory))
+                    world_state.audit_log = json.loads(json.dumps(checkpoint.audit_log)) + [
+                        {"action": "rollback", "timestamp": int(time.time())}
+                    ]
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
                 
                 elif action == "rollback":
-                    world_state.records = checkpoint.records.copy()
-                    world_state.inventory = checkpoint.inventory.copy()
-                    world_state.audit_log = checkpoint.audit_log.copy()
+                    # Same behavior as rollback_then_retry in this simplified runner
+                    world_state.records = json.loads(json.dumps(checkpoint.records))
+                    world_state.inventory = json.loads(json.dumps(checkpoint.inventory))
+                    world_state.audit_log = json.loads(json.dumps(checkpoint.audit_log)) + [
+                        {"action": "rollback", "timestamp": int(time.time())}
+                    ]
                     retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
                     continue
                 
@@ -283,9 +290,11 @@ class BaselineRunner:
         """执行单个步骤"""
         tool_map = {
             "get_record": mock_api.get_record,
+            "auth_check": mock_api.auth_check,
             "policy_check": mock_api.policy_check,
             "update_record": mock_api.update_record,
             "send_message": mock_api.send_message,
+            "notify_user": mock_api.notify_user,
             "create_ticket": mock_api.create_ticket,
             "commit": mock_api.commit,
             "rollback": mock_api.rollback,
@@ -293,6 +302,7 @@ class BaselineRunner:
             "unlock_inventory": mock_api.unlock_inventory,
             "process_payment": mock_api.process_payment,
             "refund_payment": mock_api.refund_payment,
+            "write_audit": mock_api.write_audit,
         }
         
         tool_func = tool_map.get(tool_name)
@@ -314,6 +324,25 @@ class BaselineRunner:
             "rationale_short": note,
             "source": source,
         }
+
+    def _low_confidence_fallback_action(
+        self,
+        error_type: str,
+        b2_action: str,
+        current_retries: int,
+        step_context: Optional[StepContext],
+        result,
+    ) -> str:
+        """
+        When diagnosis confidence is low, avoid immediately escalating for
+        potentially transient errors like NotFound (eventual consistency).
+        """
+        if error_type == "NotFound" and step_context is not None:
+            # Allow a couple of quick retries before escalating; keeps B3/B4 from
+            # over-escalating due to mock diagnosis noise.
+            if current_retries < 2:
+                return "retry"
+        return b2_action
 
     def _apply_safety_guard(
         self,
@@ -376,6 +405,8 @@ class BaselineRunner:
                 )
 
             diagnosis = self.diagnosis_agent.diagnose(step_context, result, history_events)
+            # 模拟 LLM 诊断延迟
+            time.sleep(0.05)
             self.llm_calls += 1
             payload = {
                 "layer_pred": diagnosis.layer,
@@ -387,9 +418,12 @@ class BaselineRunner:
 
             action = diagnosis.action
             if diagnosis.confidence < 0.7:
-                action = b2_action
+                fallback = self._low_confidence_fallback_action(
+                    error_type, b2_action, current_retries, step_context, result
+                )
+                action = fallback
                 payload["rationale_short"] = "diagnosis_low_confidence_fallback"
-                payload["fallback_action"] = b2_action
+                payload["fallback_action"] = fallback
 
             guarded = self._apply_safety_guard(action, current_retries, step_context)
             if guarded != action:
@@ -437,9 +471,12 @@ class BaselineRunner:
             }
             action = diagnosis.action
             if diagnosis.confidence < 0.7:
-                action = b2_action
+                fallback = self._low_confidence_fallback_action(
+                    error_type, b2_action, current_retries, step_context, result
+                )
+                action = fallback
                 payload["rationale_short"] = "diagnosis_low_confidence_fallback"
-                payload["fallback_action"] = b2_action
+                payload["fallback_action"] = fallback
             guarded = self._apply_safety_guard(action, current_retries, step_context)
             if guarded != action:
                 payload["final_action"] = guarded

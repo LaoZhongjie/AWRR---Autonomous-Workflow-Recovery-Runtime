@@ -19,4 +19,4 @@ dist/
 build/
 *.log
 .pytest_cache/
-.runs/
+results/

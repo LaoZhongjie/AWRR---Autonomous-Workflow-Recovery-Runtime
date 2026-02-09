@@ -11,6 +11,7 @@ class WorldState:
     audit_log: list
     fault_log: set[str] = field(default_factory=set)
     fault_plan: dict[str, bool] = field(default_factory=dict)
+    fault_state: dict = field(default_factory=dict)  # extra per-fault state (e.g., conflict needs rollback)
 
     def to_dict(self) -> dict:
         return {
@@ -29,7 +30,8 @@ class WorldState:
             inventory=json.loads(json.dumps(self.inventory)),
             audit_log=json.loads(json.dumps(self.audit_log)),
             fault_log=set(self.fault_log),
-            fault_plan=dict(self.fault_plan)
+            fault_plan=dict(self.fault_plan),
+            fault_state=json.loads(json.dumps(self.fault_state))
         )
 
 

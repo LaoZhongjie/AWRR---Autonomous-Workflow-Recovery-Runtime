@@ -117,38 +117,38 @@ class DiagnosisAgent:
         # Determine action based on layer and retry count
         if error_type in ["Timeout", "HTTP_500"]:
             action = "retry"
-            confidence = 0.85
+            confidence = 0.9
             reasoning = f"{error_type} is transient, retry recommended"
         elif error_type == "Conflict":
             action = "rollback"
-            confidence = 0.85
-            reasoning = f"{error_type} indicates state issues, rollback and retry"
+            confidence = 0.9
+            reasoning = f"{error_type} indicates state issues, rollback then retry"
         elif error_type == "NotFound":
             # Some NotFound are transient (e.g., eventual consistency). If hinted/transient, retry can help.
             if scenario == "eventual_consistency" or hinted_layer == "transient":
                 action = "retry"
-                confidence = 0.85
+                confidence = 0.8
                 reasoning = "NotFound may be transient (eventual consistency), retry recommended"
             else:
                 action = "escalate"
-                confidence = 0.85
+                confidence = 0.8
                 reasoning = "NotFound likely persistent, escalation required"
         elif error_type in ["PolicyRejected", "AuthDenied", "BadRequest", "StateCorruption"]:
             action = "escalate"
-            confidence = 0.85
+            confidence = 0.9
             reasoning = f"{error_type} requires escalation"
         else:
             if layer == "transient":
                 action = "retry"
-                confidence = 0.65
+                confidence = 0.75
                 reasoning = f"{error_type} looks transient"
             elif layer == "cascade":
                 action = "rollback"
-                confidence = 0.65
-                reasoning = f"{error_type} looks cascade-like"
+                confidence = 0.8
+                reasoning = f"{error_type} looks cascade-like (rollback safer than retry)"
             else:
                 action = "escalate"
-                confidence = 0.65
+                confidence = 0.75
                 reasoning = f"{error_type} uncertain, escalating"
 
         if confidence_override is not None:

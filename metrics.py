@@ -1,5 +1,6 @@
 import argparse
 import json
+from collections import Counter
 from collections import defaultdict
 from typing import Tuple
 
@@ -57,6 +58,25 @@ def _mttr_delta_ms(task_events, err_i: int, ok_i: int) -> float:
         total += float(e.get("latency_ms", 0) or 0)
     return total
 
+def _is_tool_error_event(e: dict) -> bool:
+    return (
+        e.get("status") == "error"
+        and e.get("event_type", "tool_call") in TOOL_EVENT_TYPES
+    )
+
+def _first_tool_error_event(task_events: list[dict]) -> dict | None:
+    for e in task_events:
+        if _is_tool_error_event(e):
+            return e
+    return None
+
+def _scalar_summary(metrics: dict) -> dict:
+    summary = {}
+    for k, v in metrics.items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            summary[k] = v
+    return summary
+
 def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     """
     从轨迹计算所有指标
@@ -110,6 +130,17 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     rco_overhead_calls_total = 0
 
     tasks_with_auth_issues = 0
+    final_reason_counts: Counter[str] = Counter()
+    recovery_action_counts: Counter[str] = Counter()
+
+    # Per-task: classify by the first error type observed.
+    first_error_type_task_counts: Counter[str] = Counter()
+    first_error_type_outcomes: dict[str, Counter[str]] = defaultdict(Counter)
+
+    # Per-event: error-type level recovery breakdown.
+    error_type_event_counts: Counter[str] = Counter()
+    recovered_error_type_event_counts: Counter[str] = Counter()
+    mttr_event_times_by_error_type: dict[str, list[float]] = defaultdict(list)
 
     for task_events in tasks.values():
         task_events = sorted(task_events, key=lambda e: e.get("ts_ms", 0))
@@ -134,30 +165,38 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
             srr_eligible_tasks += 1
             if final_event.get("srr_pass") is True:
                 srr_pass_tasks += 1
+        if final_outcome == "escalated":
+            final_reason_counts[str(final_event.get("final_reason") or "unknown")] += 1
 
-        error_events = [
-            e
-            for e in task_events
-            if e.get("status") == "error"
-            and e.get("event_type", "tool_call") in TOOL_EVENT_TYPES
-        ]
+        error_events = [e for e in task_events if _is_tool_error_event(e)]
         if error_events:
             error_tasks += 1
             if final_outcome == "success":
                 recovered_tasks += 1
 
+        first_error = _first_tool_error_event(task_events)
+        if first_error:
+            et = str(first_error.get("error_type") or "Unknown")
+            first_error_type_task_counts[et] += 1
+            first_error_type_outcomes[et][final_outcome] += 1
+
         total_error_events += len(error_events)
+        for e in error_events:
+            error_type_event_counts[str(e.get("error_type") or "Unknown")] += 1
 
         for idx, error_event in enumerate(task_events):
             if error_event.get("status") != "error":
                 continue
             recovery_action = _normalize_action(error_event.get("recovery_action"))
+            if recovery_action:
+                recovery_action_counts[recovery_action] += 1
             if recovery_action not in RECOVERY_ACTIONS:
                 continue
             if error_event.get("event_type", "tool_call") not in TOOL_EVENT_TYPES:
                 continue
             error_step = error_event.get("step_idx", 0)
             error_ts = error_event.get("ts_ms")
+            error_type = str(error_event.get("error_type") or "Unknown")
             recovered_event = next(
                 (
                     later_event
@@ -170,9 +209,12 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
             )
             if recovered_event:
                 recovered_error_events += 1
+                recovered_error_type_event_counts[error_type] += 1
                 if error_ts is not None and recovered_event.get("ts_ms") is not None:
                     ok_i = task_events.index(recovered_event)
-                    mttr_event_times.append(_mttr_delta_ms(task_events, idx, ok_i))
+                    dt = _mttr_delta_ms(task_events, idx, ok_i)
+                    mttr_event_times.append(dt)
+                    mttr_event_times_by_error_type[error_type].append(dt)
 
 
         auth_errors = [
@@ -199,7 +241,34 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
     uar = tasks_with_auth_issues / total_tasks if total_tasks else 0.0
     srr = srr_pass_tasks / srr_eligible_tasks if srr_eligible_tasks else 0.0
 
-    return {
+    # Build breakdown dicts for inspection / leaderboard details.
+    by_first_error_type = {}
+    for et, count in first_error_type_task_counts.items():
+        outs = first_error_type_outcomes.get(et, Counter())
+        succ = outs.get("success", 0)
+        esc = outs.get("escalated", 0)
+        fail = outs.get("failed", 0)
+        by_first_error_type[et] = {
+            "tasks": int(count),
+            "success": int(succ),
+            "escalated": int(esc),
+            "failed": int(fail),
+            "rr_task": (succ / count) if count else 0.0,
+            "hir": (esc / count) if count else 0.0,
+        }
+
+    by_error_type_event = {}
+    for et, cnt in error_type_event_counts.items():
+        rec = recovered_error_type_event_counts.get(et, 0)
+        mttrs = mttr_event_times_by_error_type.get(et, [])
+        by_error_type_event[et] = {
+            "error_events": int(cnt),
+            "recovered_events": int(rec),
+            "rr_event": (rec / cnt) if cnt else 0.0,
+            "mttr_event": (sum(mttrs) / len(mttrs)) if mttrs else 0.0,
+        }
+
+    full = {
         "baseline": baseline_name or "unknown",
         "wcr": wcr,
         "hir": hir,
@@ -225,10 +294,18 @@ def compute_metrics(traces_path: str, baseline_name: str | None = None) -> dict:
         "recovered_tasks": recovered_tasks,
         "total_error_events": total_error_events,
         "recovered_error_events": recovered_error_events,
+        # Extra breakdowns (non-scalar; used for deeper comparisons)
+        "final_reason_counts": dict(final_reason_counts),
+        "recovery_action_counts": dict(recovery_action_counts),
+        "by_first_error_type": by_first_error_type,
+        "by_error_type_event": by_error_type_event,
     }
+    # Keep a scalar-only view handy for CSV/table exports.
+    full["summary"] = _scalar_summary(full)
+    return full
 
 
-def print_metrics(metrics: dict):
+def print_metrics(metrics: dict, details: bool = False, topk: int = 5):
     """打印指标"""
     print(f"\n{'='*70}")
     print(f"Metrics for {metrics['baseline']}")
@@ -250,6 +327,17 @@ def print_metrics(metrics: dict):
         f"    {metrics['hir']:6.2%}  ({metrics['escalated']}/{metrics['total_tasks']})"
     )
     print(f"UAR (Unauthorized Action Rate):    {metrics['uar']:6.2%}")
+    if details:
+        reasons = metrics.get("final_reason_counts") or {}
+        if reasons:
+            top = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:topk]
+            top_str = ", ".join(f"{k}={v}" for k, v in top)
+            print(f"Top Escalate Reasons:              {top_str}")
+        actions = metrics.get("recovery_action_counts") or {}
+        if actions:
+            top = sorted(actions.items(), key=lambda kv: (-kv[1], kv[0]))[:topk]
+            top_str = ", ".join(f"{k}={v}" for k, v in top)
+            print(f"Top Recovery Actions:              {top_str}")
     print(f"{'='*70}\n")
 
 
@@ -257,7 +345,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--traces", required=True)
     parser.add_argument("--baseline", default="unknown")
+    parser.add_argument("--details", action="store_true", help="Print extra breakdowns")
     args = parser.parse_args()
     
     metrics = compute_metrics(args.traces, args.baseline)
-    print_metrics(metrics)
+    print_metrics(metrics, details=args.details)

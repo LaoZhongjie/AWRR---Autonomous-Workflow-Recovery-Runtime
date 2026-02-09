@@ -119,7 +119,7 @@ class WorkflowRunner:
             for fi in fault_injections:
                 if fi["step_idx"] == step_idx:
                     injected = mock_api.FaultInjector.should_inject(
-                        fi, step_idx, task_id, world_state
+                        fi, step_idx, task_id, world_state, attempt_idx
                     )
                     if injected:
                         fault_injection = injected
