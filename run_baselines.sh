@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SEED=${SEED:-42}
-N_TASKS=${N_TASKS:-100}
+N_TASKS=${N_TASKS:-1000}
 
 STAMP=$(date +"%Y%m%d_%H%M%S")
 OUT_DIR="results/${STAMP}"
