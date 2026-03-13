@@ -20,6 +20,40 @@ AWRR focuses on the “runtime” layer:
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart LR
+
+    subgraph Agent_Workflow
+        A[User Task] --> B[Agent Planner]
+        B --> C[Tool Execution]
+        C --> D[Environment State]
+    end
+
+    subgraph Memory_Layer
+        D --> E[Memory Bank<br/>World State + Logs + Checkpoints]
+    end
+
+    subgraph Reliability_Layer
+        E --> F{Failure Detection}
+
+        F -- No --> G[Continue Workflow]
+
+        F -- Yes --> H[Recovery Engine]
+
+        H --> I[Retry]
+        H --> J[Rollback]
+        H --> K[Saga Compensation]
+    end
+
+    I --> B
+    J --> B
+    K --> B
+    G --> B
+```
+---
+
 ## What’s in the repo (highlights)
 
 - **Fault taxonomy + controlled injection** (transient/persistent/semantic/cascade) with multiple modes (`once`, `per_attempt`, `persistent`, `stateful_conflict`) in `mock_api.py`.
