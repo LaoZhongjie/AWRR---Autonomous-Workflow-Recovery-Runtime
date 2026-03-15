@@ -1,4 +1,4 @@
-# AWRR — Autonomous Workflow Recovery Runtime
+# AWRR — Autonomous Workflow Recovery Runtime for LLM Agents
 
 Production-style reliability primitives for **multi-step agent/tool workflows**: fault injection, recovery policies, checkpoint/rollback, Saga compensation, learning-from-traces, and a repeatable evaluation harness.
 
