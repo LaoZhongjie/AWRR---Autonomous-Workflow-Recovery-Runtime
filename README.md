@@ -193,17 +193,5 @@ Benchmark & evaluation:
 - `learning_eval.py` — learning efficiency evaluation
 - `visualize_metrics.py` — plots (optional `matplotlib`)
 
----
 
-## How to talk about this in interviews (one-liners)
-
-- Built a **reliability runtime** for agent workflows: checkpoint/rollback, recovery policies, and Saga compensation for side-effects.
-- Designed a **controlled fault injection benchmark** and a reproducible evaluation harness with reliability + cost metrics.
-- Implemented **diagnosis-driven** and **learning-based** recovery baselines; measured improvements and tradeoffs via leaderboard metrics.
-
----
-
-## More detail
-
-See `AWRR.md` for the full project write-up (architecture, taxonomy, metrics definitions, experiment methodology, and roadmap).
 
